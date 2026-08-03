@@ -1,0 +1,55 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # 기본 경로: torch 없이. 이것이 실제 배포 환경(Jetson AGX aarch64)의 모습이다 —
+  # torch CPU 휠이 없어도 물리 모델 경로만으로 전 파이프라인이 돌아야 한다.
+  # (MLP 학습 테스트는 자동 skip)
+  test:
+    name: py${{ matrix.python-version }} (no torch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Verify torch is absent (skip path must be exercised)
+        run: python -c "import importlib.util as u; assert u.find_spec('torch') is None"
+      - name: Test
+        run: pytest -q
+
+  # MLP 학습 경로까지 덮는 잡. torch CPU 휠은 x86_64에만 있으므로 여기서만 돈다.
+  test-with-torch:
+    name: py3.11 + torch (MLP path)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install (+ torch CPU)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Test
+        run: pytest -q

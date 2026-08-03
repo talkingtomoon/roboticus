@@ -1,5 +1,9 @@
 # robot_core — 해커톤 코어 인프라
 
+[![tests](https://github.com/talkingtomoon/roboticus/actions/workflows/tests.yml/badge.svg)](https://github.com/talkingtomoon/roboticus/actions/workflows/tests.yml)
+[![python](https://img.shields.io/badge/python-3.10%20|%203.11%20|%203.12-blue)](pyproject.toml)
+[![deps](https://img.shields.io/badge/deps-numpy%20%2B%20pyyaml-lightgrey)](pyproject.toml)
+
 하드웨어와 미션이 무엇이든 갈아끼울 수 있게 만든 최소 뼈대.
 **실물 로봇 없이 `pytest`만으로 전부 검증된다.** 캠프 현장에서는
 [`robot_core/hal/real.py`](robot_core/hal/real.py) 한 파일만 채우면 나머지는 그대로 돌아간다.
@@ -20,26 +24,56 @@ robot_core/
   adapters/   ros2_adapter.py — rclpy 래핑법 주석 스켈레톤 (현장에서 채움)
 scripts/      field_calibration.py · baseline_switch_comparison.py ·
               check_llm_model.py
-tests/        251개 테스트, 실물·실제 API 없이 전부 통과
+tests/        284개 테스트, 실물·실제 API 없이 전부 통과
 examples/     demo_impact_and_jam.py · demo_self_recovery.py ·
               demo_chunk_switching.py · demo_full_rehearsal.py
 ```
 
-## 빠른 시작
+## 설치
+
+요구사항은 **Python 3.10+ 와 numpy·pyyaml 뿐**이다. ROS 2도, Isaac Sim도, GPU도 필요 없다.
 
 ```bash
-python -m venv .venv && .venv/Scripts/activate   # Linux/macOS: source .venv/bin/activate
-pip install numpy pyyaml pytest
-python -m pytest -q
-python examples/demo_impact_and_jam.py
-python examples/demo_self_recovery.py --no-llm   # 자가 회복 루프 (규칙 폴백 경로)
-python examples/demo_chunk_switching.py          # 충격 → 우회 궤적 스위칭
+git clone https://github.com/talkingtomoon/roboticus.git
+cd roboticus
+
+python -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+
+pip install -e ".[dev]"            # numpy · pyyaml + pytest
+python -m pytest -q                # 284 tests, ~90 s
 ```
 
-실제 LLM 경로를 쓰려면 `pip install anthropic` 후 `ANTHROPIC_API_KEY` 환경변수를 설정한다.
-**키가 없어도 모든 것이 동작한다** — 시뮬레이트된 LLM 또는 규칙 폴백으로 간다.
+`-e` 없이 `pip install numpy pyyaml pytest` 만 해도 된다 — 저장소 루트에서 실행하면
+`pythonpath` 설정([pyproject.toml](pyproject.toml))으로 import 된다.
 
-`pip install -e .` 도 되지만 필수는 아니다 (저장소 루트에서 실행하면 import 된다).
+### 선택 의존성 (둘 다 없어도 전부 동작한다)
+
+| 패키지 | 설치 | 없으면 |
+|---|---|---|
+| `torch` | `pip install torch --index-url https://download.pytorch.org/whl/cpu` | MLP 델타 모델 **학습**만 생략. 물리 모델 경로로 파이프라인 완주하고 관련 테스트는 자동 skip (CI가 이 경로를 기본으로 검증한다) |
+| `anthropic` | `pip install anthropic` + `ANTHROPIC_API_KEY` | LLM 자가 회복이 **규칙 폴백**으로 동작. 캠프 인터넷이 불안정해도 시스템은 계속 간다 |
+
+> Jetson AGX(aarch64)에서는 torch 휠이 없을 수 있다 — 의도된 시나리오다.
+> 런타임 추론은 numpy로만 하므로 실기 성능에는 영향이 없다.
+> 자세한 절차는 [Jetson 준비 절차](#jetson-agx-aarch64-준비-절차) 참고.
+
+### 바로 돌려보기
+
+```bash
+python examples/demo_full_rehearsal.py           # 통합 리허설: 시나리오 5종 (권장 시작점)
+python examples/demo_chunk_switching.py          # 충격 → 우회 궤적 스위칭
+python examples/demo_self_recovery.py --no-llm   # 자가 회복 루프 (규칙 폴백 경로)
+python examples/demo_impact_and_jam.py           # 목 시뮬레이터 + 링버퍼 로거
+```
+
+### CI
+
+[`.github/workflows/tests.yml`](.github/workflows/tests.yml) — push/PR마다 두 갈래로 돈다:
+
+- **py3.10 / 3.11 / 3.12, torch 없음** — 실배포 환경(Jetson)과 같은 구성.
+  torch가 실제로 없는지 확인하는 단계까지 넣어 skip 경로가 반드시 검증되게 했다.
+- **py3.11 + torch CPU** — MLP 학습 경로까지 커버.
 
 ## 핵심 규약: 임피던스 제어
 
