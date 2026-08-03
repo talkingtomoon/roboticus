@@ -1,0 +1,38 @@
+==============================================================================
+ROBOT STATE DUMP | 200 samples | 3 joints | window 0.199 s
+time span: t = 0.001 s .. 0.200 s   (robot clock)
+units: q,q_des [rad]  qd [rad/s]  tau [Nm]  time [s]
+==============================================================================
+
+[TIMING]
+  rate       :   1000.0 Hz achieved   (period mean 1.000 ms, jitter(std) 0.000 ms)
+  period     : min 1.000 | p50 1.000 | p95 1.000 | max 1.000  [ms]
+  compute    : mean 0.080 ms | max 0.080 ms
+  overruns   : 1 / 200 (0.50%)
+
+[PER-JOINT TORQUE]  tau_measured  (peak = |tau|가 최대인 순간의 부호 있는 값)
+  jnt |    mean |     rms |    peak |  at t   | thresh |  status
+  --------------------------------------------------------------------
+    0 |   0.000 |   0.000 |   0.000 |   0.001 |  10.00 | ok (0% of thresh)
+    1 |  -0.648 |   5.766 |  15.000 |   0.101 |  10.00 | EXCEEDED (16 samples, 8.0%)
+    2 |   0.000 |   0.000 |   0.000 |   0.001 |  10.00 | ok (0% of thresh)
+
+[PER-JOINT TRACKING]
+  jnt |   q_now | qdes_now | err_now | err_max |  |qd|max
+  ----------------------------------------------------------
+    0 |   0.000 |    0.000 |   0.000 |   0.000 |     0.000
+    1 |   0.155 |    0.000 |  -0.155 |   0.211 |     6.145
+    2 |   0.000 |    0.000 |   0.000 |   0.000 |     0.000
+
+[THRESHOLD EXCURSIONS]  |tau| > threshold
+  joint 1: t=0.101..0.116 s (0.015 s, 16 samples) peak +15.000 Nm @ t=0.101 (thresh 10.00)
+
+[EVENTS]
+  t=0.100  disturbance 15 Nm / 30 ms injected on joint 1
+
+[LAST SAMPLE]  t=0.200 s
+  q      :    0.000    0.155    0.000
+  qd     :    0.000   -2.723    0.000
+  tau    :    0.000   -2.062    0.000
+  q_des  :    0.000    0.000    0.000
+==============================================================================

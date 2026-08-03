@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "robot_core"
+version = "0.1.0"
+description = "Hackathon core infra: HAL + mock robot sim + control loop runner + ring logger"
+requires-python = ">=3.10"
+dependencies = ["numpy", "pyyaml"]
+
+# LLM 자가 회복 경로를 실제 API로 쓸 때만 필요 (없어도 규칙 폴백으로 동작):
+#   pip install anthropic  +  환경변수 ANTHROPIC_API_KEY
+
+[project.optional-dependencies]
+dev = ["pytest"]
+# MLP 델타 모델 학습용 (물리 모델·추론은 torch 없이 동작):
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+delta-mlp = ["torch"]
+
+[tool.setuptools.packages.find]
+include = ["robot_core*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
