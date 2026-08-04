@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass
 
@@ -29,11 +30,24 @@ class _Event:
 
 class FeedbackCache:
     def __init__(self, n_axes: int = N_AXES, window_sec: float = 8.0,
-                 max_samples: int = 60_000) -> None:
+                 max_samples: int = 60_000,
+                 event_log_path=None) -> None:
+        """event_log_path: 주면 mark_event가 JSONL로도 스트리밍한다 (세션 로그).
+
+        메모리 타임라인은 deque(maxlen=300)라 데모 한 번이면 찬다 — 현장
+        디버깅("아까 그거 왜 그랬지")은 파일이 담당한다. 한 줄씩 즉시 flush.
+        """
         self.n_axes = int(n_axes)
         self.window_sec = float(window_sec)
+        self._event_log = None
+        if event_log_path is not None:
+            from pathlib import Path
+            p = Path(event_log_path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            self._event_log = open(p, "a", encoding="utf-8", buffering=1)
         self._frames: deque[PhorceFeedback] = deque(maxlen=int(max_samples))
         self._latest: PhorceFeedback | None = None
+        self._latest_wall: float | None = None
         self._events: deque[_Event] = deque(maxlen=300)
         self._lock = threading.Lock()
 
@@ -42,10 +56,16 @@ class FeedbackCache:
         """수신 콜백 전용. 저장만 한다 — 여기에 판단을 넣지 말 것."""
         self._frames.append(frame)      # deque append는 원자적
         self._latest = frame
+        # 수신 벽시계 스탬프 — 워치독의 신선도 기준 (로봇 클록과 독립)
+        self._latest_wall = time.monotonic()
 
     # ------------------------------------------------------------ 느린 경로
     def latest(self) -> PhorceFeedback | None:
         return self._latest
+
+    def latest_wall(self) -> float | None:
+        """마지막 프레임의 수신 벽시계 시각 (프레임 없으면 None)."""
+        return self._latest_wall
 
     def __len__(self) -> int:
         return len(self._frames)
@@ -83,14 +103,25 @@ class FeedbackCache:
         if t is None:
             t = self._latest.t if self._latest is not None else 0.0
         self._events.append(_Event(t=float(t), text=str(text)))
+        if self._event_log is not None:
+            import json
+            self._event_log.write(json.dumps(
+                {"t": float(t), "wall": time.monotonic(), "text": str(text)},
+                ensure_ascii=False) + "\n")
 
     def events(self) -> list:
         return list(self._events)
+
+    def close(self) -> None:
+        if self._event_log is not None:
+            self._event_log.close()
+            self._event_log = None
 
     def clear(self) -> None:
         with self._lock:
             self._frames.clear()
         self._latest = None
+        self._latest_wall = None
         self._events.clear()
 
     def dump_text(self, window_sec: float = 2.0) -> str:

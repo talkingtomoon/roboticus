@@ -102,7 +102,8 @@ def build_world(*, client=None, selector_cls=MotionSelector,
         config=LLMConfig(timeout_s=2.0, cooldown_s=2.0), client=client,
         time_fn=lambda: hal.t)
     plan = MissionPlan(list(plan_tags))
-    sup = Supervisor(hal, cache, detector, selector, agent, catalog, plan)
+    sup = Supervisor(hal, cache, detector, selector, agent, catalog, plan,
+                     guard=guard)
     for w in warns:
         cache.mark_event("catalog: " + w)
     return hal, cache, sup, plan, guard

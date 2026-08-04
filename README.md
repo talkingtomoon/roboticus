@@ -39,9 +39,9 @@ robot_core/
   integration/ scenarios.py(리허설 5종) · timeline.py(단일 시간축)
   adapters/    phorce_ros2.py — rclpy 주석 스켈레톤 (qos_profile_sensor_data 필수)
   legacy/      임피던스 인터페이스 시절 스냅샷 (참고용 — 삭제 아님)
-scripts/       annotate_motion.py · field_smoke.py · baseline_selector_comparison.py ·
-               check_llm_model.py · legacy/
-tests/         129개 테스트, 실물·실제 API 없이 전부 통과
+scripts/       annotate_motion.py · validate_catalog.py · field_smoke.py ·
+               baseline_selector_comparison.py · check_llm_model.py · legacy/
+tests/         162개 테스트, 실물·실제 API 없이 전부 통과
 examples/      demo_full_rehearsal.py · legacy/
 ```
 
@@ -52,7 +52,7 @@ git clone https://github.com/talkingtomoon/roboticus.git
 cd roboticus
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
-python -m pytest -q                                  # 129 tests
+python -m pytest -q                                  # 162 tests
 python examples/demo_full_rehearsal.py               # 리허설 시나리오 5종
 ```
 
@@ -70,6 +70,25 @@ LLM 경로를 쓰려면 `pip install anthropic` + `ANTHROPIC_API_KEY` — **없�
 | 12/13 거절 = 사람 개입 | `WAITING_OPERATOR` 상태 — `operator_cleared()` 전 재시도 금지 | `test_operator_rejection_waits...` |
 | valid=False 축 신뢰 금지 | 감지기·선택기 모두 valid 마스크 전제 | `test_invalid_axis_excluded...` |
 | 경계 감지 1차 = 핸들 완료 | `play_async` 핸들 이벤트, is_busy 폴링은 유실 폴백 | `test_boundary_fallback...` |
+| 피드백 신선도 `kStateFreshLimitMs=1500` | 워치독 — 수신 벽시계 정체 시 자동 halt (마지막 프레임으로 계속 판단 금지) | `test_watchdog_halts...` |
+
+## 안전 계열 (2026-08-05 추가)
+
+- **스레드 모드 검증**: 실물 경로(판단 스레드 + LLM 워커 + 1kHz 수신)를
+  통합 테스트로 — 결정 전달의 원자적 소비(`_take_pending`)가 여기서 나왔다
+- **소프트 정지**: `halt()/resume()` + `HALTED` 상태. 재생 중 모션은 중단
+  불가(인터페이스 제약)이지만 새 play는 절대 안 나간다. 관찰은 계속
+- **서킷브레이커**: 같은 (실패,축)이 60초 창 안에 3회면 rest 강등, 5회면 halt.
+  '계획 전진'을 리셋 신호로 쓰지 않는다 — 재생 완료는 시간 기준이라
+  물리적 실패도 전진시키기 때문. `resume()`(사람 개입)만 리셋
+- **preflight 게이트**: `start()`가 시작 전 검사 — 카탈로그/적재/계획 태그
+  커버리지, E-stop·EtherCAT(`status()`), 피드백 침묵(QoS 증상). 실패 시
+  명확한 메시지와 함께 시작 거부
+- **의도 게이트**: `request_intent(tag, urgency)` — 사람/음성/미래 파이프라인의
+  주입점. **진입점이 어디든 태그는 전부 TagSafetyGuard를 지난다**
+  (STT 오인식 "정지"→"저지" 같은 미지 태그 방어)
+- **세션 로그**: `FeedbackCache(event_log_path=...)` — 타임라인을 JSONL로
+  스트리밍 (메모리 deque 300개는 데모 한 번이면 찬다)
 
 ## 실패 감지 (recovery/detector.py)
 
@@ -139,6 +158,7 @@ python -m robot_core.integration.scenarios --scenario S5   # 타임라인 포함
 | 1 | **현장 호환성 스모크** — 파사드 가정 6개 실측 (sim:demo 대상) | `python scripts/field_smoke.py` | 10분 |
 | 2 | RealPhorceHAL 작성 — 파사드를 PhorceHAL 인터페이스로 래핑 (스모크가 깨진 가정의 코드 위치를 알려준다) | [robot_core/hal/phorce.py](robot_core/hal/phorce.py) `PhorceHAL` 계약 | 30–60분 |
 | 3 | 교시된 모션 주석 달기 (모션당 1회 재생) | `python scripts/annotate_motion.py --id N --name ... --tags ...` | 모션당 2분 |
+| 3.5 | **교시 세션 끝나기 전에** 카탈로그·계획 정적 검증 (오타/커버리지/회피 양방향/모션 길이) — 문제는 지금 알아야 다시 가르칠 시간이 있다 | `python scripts/validate_catalog.py --catalog catalog.json --plan approach,insert,...` | 2분 |
 | 4 | 감지 임계 반영 — 스모크 A6이 제안한 값으로 | [recovery/detector.py](robot_core/recovery/detector.py) `DetectorConfig` | 5분 |
 | 5 | 임무 계획 정의 — 태그 시퀀스 | `MissionPlan([...])` | 5분 |
 | 6 | LLM 경로 점검 (키 설정 후 모델 문자열 검증) | `python scripts/check_llm_model.py` | 5분 |

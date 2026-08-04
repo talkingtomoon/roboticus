@@ -173,6 +173,13 @@ class PhorceHAL:
     def catalog(self) -> dict[int, float]:
         raise NotImplementedError
 
+    def status(self) -> dict:
+        """로봇 상태 (robot.status() 대응). preflight가 본다.
+
+        최소 키: estop_active(bool), ethercat_operational(bool).
+        """
+        raise NotImplementedError
+
     def watch(self, callback) -> None:
         """1kHz 피드백 콜백 등록. **콜백에서는 최신 상태 저장만 할 것** —
         판단/전송을 여기 넣으면 수신 스레드가 밀려 stale이 쌓인다."""
@@ -214,7 +221,11 @@ class MockPhorceHAL(PhorceHAL):
         loaded_ids: set[int] | None = None,
         q0: np.ndarray | None = None,
         temp_ambient: float = 35.0,
-        heat_k: float = 0.35,      # dT/dt += heat_k * current^2
+        # 열 모델은 실물 스케일로 보수적으로: 12A(잼 극단)에서도 ~2°C/s.
+        # 목적은 열 예측이 아니라 "시나리오가 의도한 것만 테스트하게" —
+        # 과장된 계수는 막힘 시나리오에 과열을 끼워 넣어 리허설을 오염시킨다.
+        # 실물 계수는 scripts/field_smoke.py A6 분포를 보고 조정.
+        heat_k: float = 0.015,     # dT/dt += heat_k * current^2
         cool_k: float = 0.08,      # dT/dt -= cool_k * (T - ambient)
         dynamics_kwargs: dict | None = None,
     ) -> None:
@@ -251,6 +262,8 @@ class MockPhorceHAL(PhorceHAL):
         self._valid = np.ones(N_AXES, dtype=bool)
         self._stale = np.zeros(N_AXES, dtype=bool)
         self._fault = np.zeros(N_AXES, dtype=bool)
+        self._estop = False
+        self._ethercat = True
         self.play_call_count = 0    # BUSY 폭주 테스트용 계측
 
         self.step(1)  # 첫 프레임 생성 (latest_feedback가 바로 쓸 수 있게)
@@ -289,6 +302,14 @@ class MockPhorceHAL(PhorceHAL):
     def clear_fault(self, axis: int) -> None:
         self._fault[axis] = False
 
+    def set_estop(self, active: bool) -> None:
+        """E-stop 상태 주입 (preflight 테스트용)."""
+        self._estop = bool(active)
+
+    def set_ethercat(self, operational: bool) -> None:
+        """EtherCAT 동작 상태 주입 (preflight 테스트용)."""
+        self._ethercat = bool(operational)
+
     def abort_playback(self, reason: str = "injected abort") -> None:
         """재생 강제 중단 — 로봇은 현재(임의) 자세에 남는다."""
         if self._playing is None:
@@ -311,6 +332,14 @@ class MockPhorceHAL(PhorceHAL):
     def catalog(self) -> dict[int, float]:
         """적재 슬롯 정본 (robot.motions() 대응): {id: duration_s}."""
         return {mid: self._catalog[mid].duration_s for mid in sorted(self._loaded)}
+
+    def status(self) -> dict:
+        return {
+            "estop_active": self._estop,
+            "ethercat_operational": self._ethercat,
+            "playing": self._playing is not None,
+            "loaded_count": len(self._loaded),
+        }
 
     def watch(self, callback) -> None:
         self._callbacks.append(callback)
