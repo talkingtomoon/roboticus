@@ -13,6 +13,9 @@ class FailureType(str, Enum):
     OVERHEAT = "OVERHEAT"              # temp_c 임계 초과 — 지속 과부하의 phorce 판
     OVERHEAT_CLEARED = "OVERHEAT_CLEARED"  # 과열 해제 통지 (실패 아님 — 복귀 트리거)
     AXIS_FAULT = "AXIS_FAULT"          # fault 비트 발화 — 축 이상
+    # 재생은 (시간상) 완료됐지만 실제 자세가 교시 종료 자세(end_pose)에서 멂.
+    # "완료 ≠ 성공"의 정면 대응 — 계획을 전진시키지 않고 재선곡을 유도한다.
+    MOTION_INCOMPLETE = "MOTION_INCOMPLETE"
 
     # ---- legacy (임피던스 인터페이스 시절 — robot_core/legacy 참고용 코드가 참조) ----
     TORQUE_SPIKE = "TORQUE_SPIKE"

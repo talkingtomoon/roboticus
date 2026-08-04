@@ -11,14 +11,16 @@ HOME = np.zeros(N_AXES)
 POSE = np.zeros(N_AXES); POSE[:3] = [0.5, -0.3, 0.6]
 
 
-def meta(mid, name, tags, p0=None, direction=(0, 1.0), T=1.0):
+def meta(mid, name, tags, p0=None, direction=(0, 1.0), T=1.0, end=None):
     p0 = HOME if p0 is None else p0
     d = np.zeros(N_AXES)
     if direction is not None:
         d[direction[0]] = direction[1]
         n = np.linalg.norm(d)
         d = d / n if n else d
-    return MotionMeta(mid, name, list(tags), p0, d, T)
+    # 건강한 현대 카탈로그는 end_pose를 가진다 (annotate가 자동 추출)
+    end = (p0 if end is None else end)
+    return MotionMeta(mid, name, list(tags), p0, d, T, end_pose=end)
 
 
 def good_catalog():
@@ -85,18 +87,48 @@ def test_zero_direction_non_rest_is_error():
     assert any("no_dir" in e and "initial_direction" in e for e in errors)
 
 
-def test_step_linkage_distance_warns():
-    """단계 간 시작자세가 진입 임계보다 멀면 연결 경고 (근사 검사)."""
+def test_step_linkage_uses_end_pose_precisely():
+    """정밀 연결 검사: 이전 단계 end_pose ↔ 다음 단계 start_pose.
+
+    approach가 POSE에서 끝나고 insert가 POSE에서 시작하면 —
+    시작자세끼리는 멀어도(근사 검사면 경고) 정밀 검사는 통과해야 한다.
+    """
+    cat = MotionCatalog([
+        meta(1, "approach", ["approach"], HOME, end=POSE),   # HOME→POSE
+        meta(2, "insert", ["insert"], POSE, (3, 1.0)),        # POSE에서 시작
+        meta(3, "rest", ["rest"], HOME, None),
+        meta(4, "ret_l", ["retreat"], HOME, (1, +1.0)),
+        meta(5, "ret_r", ["retreat"], HOME, (1, -1.0)),
+    ])
+    _, warnings = validate(cat, ["approach", "insert"], entry_max_dist=0.5)
+    assert not any("'approach'→'insert'" in w for w in warnings)
+
+
+def test_step_linkage_warns_on_real_gap():
     far = HOME.copy(); far[:3] = 5.0
     cat = MotionCatalog([
-        meta(1, "approach", ["approach"], HOME),
-        meta(2, "insert_far", ["insert"], far, (3, 1.0)),
+        meta(1, "approach", ["approach"], HOME, end=POSE),
+        meta(2, "insert_far", ["insert"], far, (3, 1.0)),     # 어디서도 못 이음
         meta(3, "rest", ["rest"], HOME, None),
         meta(4, "ret_l", ["retreat"], HOME, (1, +1.0)),
         meta(5, "ret_r", ["retreat"], HOME, (1, -1.0)),
     ])
     _, warnings = validate(cat, ["approach", "insert"], entry_max_dist=0.8)
-    assert any("'approach'→'insert'" in w for w in warnings)
+    assert any("'approach'→'insert'" in w and "종료↔시작" in w for w in warnings)
+
+
+def test_missing_end_pose_falls_back_to_approx_with_warning():
+    """구버전 주석(end_pose 없음): 근사 검사로 폴백 + 재주석 권장 경고."""
+    cat = MotionCatalog([
+        MotionMeta(1, "approach", ["approach"], HOME,
+                   np.eye(N_AXES)[0], 1.0),                   # end_pose=None
+        meta(2, "insert", ["insert"], HOME, (3, 1.0)),
+        meta(3, "rest", ["rest"], HOME, None),
+        meta(4, "ret_l", ["retreat"], HOME, (1, +1.0)),
+        meta(5, "ret_r", ["retreat"], HOME, (1, -1.0)),
+    ])
+    _, warnings = validate(cat, ["approach", "insert"])
+    assert any("end_pose 주석 없음" in w for w in warnings)
 
 
 def test_empty_catalog_is_error():

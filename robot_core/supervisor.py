@@ -64,6 +64,11 @@ class SupervisorConfig:
     fresh_limit_s: float = K_STATE_FRESH_LIMIT_MS / 1000.0
     # 버스 전압 경고 (한 줄짜리 감시 — 전압 강하는 실물의 흔한 문제)
     bus_v_warn: float = 42.0
+    # 도달 판정: 재생 완료 후 |q - end_pose| 최대 오차가 이보다 크면
+    # MOTION_INCOMPLETE (완료 ≠ 성공 — 재생 완료는 시간 기준일 뿐이다).
+    # end_pose 없는 구버전 주석은 판정불가로 통과.
+    incomplete_err_rad: float = 0.15
+
     # 서킷브레이커: 같은 (실패, 축)이 시간창 안에 N회면 rest로 강등, M회면 halt.
     # (stall→retry→stall→retry 무한 루프 차단.)
     # 리셋 신호로 '계획 전진'을 쓰지 않는 이유: 재생 완료는 시간 기준이라
@@ -115,6 +120,7 @@ class Supervisor:
         self._last_busv_warn = -1e9
         self.busy_rejections = 0         # 재생 중 play 시도 (0이어야 정상)
         self.no_candidate_ticks = 0
+        self.last_arrival: dict | None = None   # 직전 재생의 도달 판정 (뷰용)
         self._thread: threading.Thread | None = None
         self._stop_evt = threading.Event()
 
@@ -207,6 +213,7 @@ class Supervisor:
                                 "urgency": pending.urgency,
                                 "source": pending.source}),
             "hold_rest": self._hold_rest,
+            "last_arrival": self.last_arrival,
             "busy_rejections": self.busy_rejections,
             "breaker": {f"{k[0]}:ax{k[1]}": len(v)
                         for k, v in self._fail_times.items() if v},
@@ -359,35 +366,44 @@ class Supervisor:
                                           "resuming plan")
                 continue
 
-            # 서킷브레이커: 같은 실패가 롤링 창 안에 반복되면 강등/정지
-            times = self._fail_times.setdefault(ev.key, [])
-            times.append(ev.t)
-            cutoff = ev.t - self.cfg.breaker_window_s
-            times[:] = [t for t in times if t >= cutoff]
-            streak = len(times)
-            if streak >= self.cfg.breaker_halt:
-                self.halt(f"circuit breaker: {ev.type.value} ax{ev.joint_idx} "
-                          f"x{streak}/{self.cfg.breaker_window_s:.0f}s — "
-                          f"같은 실패 반복, 사람이 볼 차례")
-                return
-            if streak >= self.cfg.breaker_demote:
-                self.cache.mark_event(
-                    f"circuit breaker: {ev.type.value} ax{ev.joint_idx} "
-                    f"x{streak} — demoting to rest (LLM 우회)")
-                self._on_decision(TagDecision(
-                    intent_tag="rest", urgency="stop",
-                    source=f"breaker:{ev.type.value}x{streak}",
-                    reasoning="repeated failure"), ev)
-                continue
+            if self._handle_failure_event(ev):
+                return                       # 브레이커가 halt시켰다
 
-            if self.agent is not None:
-                accepted = self.agent.submit(ev)
-                if not accepted:
-                    self.cache.mark_event(
-                        f"recovery submit dropped (cooldown/queue) "
-                        f"{ev.type.value} ax{ev.joint_idx}")
-                elif self.cfg.sync_recovery:
-                    self.agent.process_pending()
+    def _handle_failure_event(self, ev: FailureEvent) -> bool:
+        """브레이커 집계 → (강등 | 정지 | 회복 제출). True = halt 발생.
+
+        감지기 이벤트와 도달 판정(MOTION_INCOMPLETE)이 같은 경로를 탄다 —
+        미도달도 실패로 집계되므로 브레이커 카운트에 포함된다.
+        """
+        times = self._fail_times.setdefault(ev.key, [])
+        times.append(ev.t)
+        cutoff = ev.t - self.cfg.breaker_window_s
+        times[:] = [t for t in times if t >= cutoff]
+        streak = len(times)
+        if streak >= self.cfg.breaker_halt:
+            self.halt(f"circuit breaker: {ev.type.value} ax{ev.joint_idx} "
+                      f"x{streak}/{self.cfg.breaker_window_s:.0f}s — "
+                      f"같은 실패 반복, 사람이 볼 차례")
+            return True
+        if streak >= self.cfg.breaker_demote:
+            self.cache.mark_event(
+                f"circuit breaker: {ev.type.value} ax{ev.joint_idx} "
+                f"x{streak} — demoting to rest (LLM 우회)")
+            self._on_decision(TagDecision(
+                intent_tag="rest", urgency="stop",
+                source=f"breaker:{ev.type.value}x{streak}",
+                reasoning="repeated failure"), ev)
+            return False
+
+        if self.agent is not None:
+            accepted = self.agent.submit(ev)
+            if not accepted:
+                self.cache.mark_event(
+                    f"recovery submit dropped (cooldown/queue) "
+                    f"{ev.type.value} ax{ev.joint_idx}")
+            elif self.cfg.sync_recovery:
+                self.agent.process_pending()
+        return False
 
     def _on_decision(self, decision: TagDecision, event) -> None:
         """결정 수신 (에이전트 워커/외부 의도 — 어느 스레드든). 최신 결정만 유지."""
@@ -412,7 +428,22 @@ class Supervisor:
             try:
                 mid = self._handle.result()
                 self.cache.mark_event(f"play done: motion {mid}")
-                if (self._current_meta is not None
+                arrival = self._assess_arrival(mid)
+                self.last_arrival = arrival
+                if arrival["status"] == "incomplete":
+                    # 완료 ≠ 성공: 계획을 전진시키지 않는다 — 다음 선곡이
+                    # 같은 단계를 다시 시도하고, 반복되면 브레이커가 잡는다
+                    ev = FailureEvent(
+                        FailureType.MOTION_INCOMPLETE, arrival["axis"],
+                        severity=min(1.0, arrival["err_rad"]
+                                     / (2 * self.cfg.incomplete_err_rad)),
+                        t=self._time(),
+                        snapshot={"motion_id": mid,
+                                  "err_rad": round(arrival["err_rad"], 3),
+                                  "threshold": self.cfg.incomplete_err_rad})
+                    self.cache.mark_event(f"DETECTED {ev.describe()}", t=ev.t)
+                    self._handle_failure_event(ev)
+                elif (self._current_meta is not None
                         and self.plan.advance_if_matches(self._current_meta)):
                     self.cache.mark_event(
                         f"plan advanced -> next={self.plan.next_tag!r} "
@@ -422,7 +453,8 @@ class Supervisor:
                 self.cache.mark_event(f"play ABORTED: {e} — robot at arbitrary pose")
             self._handle = None
             self._current_meta = None
-            self.state = SupervisorState.DECIDING
+            if self.state != SupervisorState.HALTED:   # 브레이커 halt 존중
+                self.state = SupervisorState.DECIDING
             return True
 
         # 핸들 유실 폴백: is_busy 폴링
@@ -432,6 +464,24 @@ class Supervisor:
             self.state = SupervisorState.DECIDING
             return True
         return False
+
+    def _assess_arrival(self, motion_id: int) -> dict:
+        """재생 완료 후 실제 자세 ↔ 교시 종료 자세(end_pose) 대조.
+
+        end_pose 없는 구버전 주석은 'unknown' (판정불가) — 막지 않는다.
+        """
+        meta = self._current_meta
+        fb = self.cache.latest()
+        if meta is None or meta.end_pose is None or fb is None:
+            return {"motion_id": motion_id, "status": "unknown",
+                    "err_rad": None, "axis": None}
+        err_vec = np.where(fb.usable,
+                           np.abs(fb.position_rad - meta.end_pose), 0.0)
+        axis = int(err_vec.argmax())
+        err = float(err_vec[axis])
+        status = "incomplete" if err > self.cfg.incomplete_err_rad else "ok"
+        return {"motion_id": motion_id, "status": status,
+                "err_rad": round(err, 3), "axis": axis}
 
     # ----------------------------------------------------------- 내부: 선곡
     def _restore_pending(self, taken: TagDecision | None) -> None:

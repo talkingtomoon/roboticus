@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>로봇 안내</title>
+<style>
+  /* 운용자용 간이 페이지 — 대시보드(/)와 독립. 컴포넌트 공유 없음. */
+  :root { --bg:#0f1216; --card:#1a2027; --fg:#f2f5f7; --dim:#93a0ab;
+          --green:#2ea043; --orange:#d29922; --red:#da3633; --blue:#316dca; }
+  * { box-sizing:border-box; margin:0; }
+  body { background:var(--bg); color:var(--fg);
+         font:18px/1.6 system-ui, "Malgun Gothic", sans-serif;
+         max-width:560px; margin:0 auto; padding:16px 16px 190px; }
+  #headline { font-size:30px; font-weight:800; line-height:1.35;
+              padding:26px 20px; border-radius:14px; margin-bottom:14px;
+              background:var(--card); border-left:10px solid var(--dim); }
+  #headline.info { border-left-color:var(--green); }
+  #headline.action { border-left-color:var(--orange); }
+  #headline.danger { border-left-color:var(--red); }
+  #detail { font-size:19px; color:var(--dim); padding:0 8px 14px; }
+  #steps { display:none; background:var(--card); border-radius:14px;
+           padding:18px 18px 18px 8px; margin-bottom:14px; }
+  #steps.show { display:block; }
+  #steps h2 { font-size:15px; color:var(--orange); margin:0 0 10px 14px;
+              letter-spacing:1px; }
+  #steps ol { font-size:20px; font-weight:600; margin-left:34px; }
+  #steps li { padding:7px 0; }
+  /* 하단 고정 버튼 */
+  .dock { position:fixed; left:0; right:0; bottom:0; padding:12px;
+          background:rgba(15,18,22,0.96); border-top:1px solid #2a323b; }
+  .dock-inner { max-width:560px; margin:0 auto; }
+  .row3 { display:flex; gap:10px; margin-bottom:10px; }
+  .row3 button { flex:1; min-height:64px; font-size:20px; font-weight:800;
+                 border:0; border-radius:14px; color:#fff; cursor:pointer; }
+  #btnHalt { background:var(--red); }
+  #btnResume { background:var(--green); }
+  #btnResolve { background:var(--blue); }
+  button:disabled { opacity:0.35; cursor:default; }
+  button:active:not(:disabled) { transform:scale(0.97); }
+  .quick { display:flex; gap:8px; margin-bottom:8px; }
+  .quick button { flex:1; min-height:48px; font-size:16px; font-weight:700;
+                  background:#28313b; color:var(--fg); border:0;
+                  border-radius:10px; cursor:pointer; }
+  .inputrow { display:flex; gap:8px; }
+  #txt { flex:1; min-height:52px; font-size:17px; padding:0 14px;
+         border-radius:10px; border:1px solid #2a323b;
+         background:#0b0e12; color:var(--fg); }
+  #btnSend { min-width:84px; min-height:52px; font-size:17px; font-weight:700;
+             background:var(--blue); color:#fff; border:0; border-radius:10px; }
+  #feedback { font-size:15px; min-height:22px; padding:6px 4px 0;
+              color:var(--dim); }
+  #feedback.ok { color:var(--green); } #feedback.no { color:var(--red); }
+</style>
+</head>
+<body>
+
+<div id="headline" class="info">연결 중...</div>
+<div id="detail"></div>
+<div id="steps"><h2>지금 해야 할 일</h2><ol id="stepList"></ol></div>
+
+<div class="dock"><div class="dock-inner">
+  <div class="row3">
+    <button id="btnHalt">🛑 멈춰</button>
+    <button id="btnResume">▶ 재개</button>
+    <button id="btnResolve" disabled>✅ 해결했어요</button>
+  </div>
+  <div class="quick">
+    <button data-say="천천히 다시 해봐">천천히</button>
+    <button data-say="잠깐 쉬어">쉬어</button>
+    <button data-say="처음부터 다시 해봐">처음부터</button>
+  </div>
+  <div class="inputrow">
+    <input id="txt" placeholder="로봇에게 말하기...">
+    <button id="btnSend">전송</button>
+  </div>
+  <div id="feedback"></div>
+</div></div>
+
+<script>
+"use strict";
+// 문구는 전부 /api/guidance에서 온다 — 여기 하드코딩 금지.
+async function poll() {
+  try {
+    const g = await (await fetch("/api/guidance")).json();
+    const h = document.getElementById("headline");
+    h.textContent = g.headline;
+    h.className = g.severity;
+    document.getElementById("detail").textContent = g.detail || "";
+    const steps = document.getElementById("steps");
+    const list = document.getElementById("stepList");
+    if (g.steps && g.steps.length) {
+      list.innerHTML = g.steps.map(s => `<li>${esc(s)}</li>`).join("");
+      steps.classList.add("show");
+    } else {
+      steps.classList.remove("show");
+    }
+    document.getElementById("btnResolve").disabled = !g.show_resolve;
+  } catch (e) {
+    const h = document.getElementById("headline");
+    h.textContent = "화면 연결이 끊겼어요. 운영 담당자를 불러주세요.";
+    h.className = "danger";
+  }
+}
+function esc(s){return s.replace(/&/g,"&amp;").replace(/</g,"&lt;");}
+
+function say(text) {
+  return fetch("/api/intent", {method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({text})}).then(r => r.json()).then(r => {
+      const f = document.getElementById("feedback");
+      f.className = r.accepted ? "ok" : "no";
+      f.textContent = r.accepted ? "전달했어요: " + text
+        : "이해하지 못했어요 — 다르게 말해 보세요.";
+      poll();
+    });
+}
+
+document.getElementById("btnHalt").onclick =
+  () => fetch("/api/halt", {method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({reason:"운용자 페이지 멈춰 버튼"})}).then(poll);
+document.getElementById("btnResume").onclick = () => {
+  if (confirm("로봇이 다시 움직입니다. 재개할까요?"))
+    fetch("/api/resume", {method:"POST"}).then(poll);
+};
+document.getElementById("btnResolve").onclick = () => {
+  if (confirm("절차를 마쳤나요? 로봇이 다시 움직입니다."))
+    fetch("/api/operator_cleared", {method:"POST"}).then(poll);
+};
+for (const b of document.querySelectorAll(".quick button"))
+  b.onclick = () => say(b.dataset.say);
+document.getElementById("btnSend").onclick = () => {
+  const t = document.getElementById("txt");
+  if (t.value.trim()) { say(t.value.trim()); t.value = ""; }
+};
+document.getElementById("txt").addEventListener("keydown",
+  e => { if (e.key === "Enter") document.getElementById("btnSend").click(); });
+
+poll();
+setInterval(poll, 1000);
+</script>
+</body>
+</html>

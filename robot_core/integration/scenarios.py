@@ -55,7 +55,8 @@ def _hold(p):
 def _meta(mid, name, tags, p0, p1, T, notes=""):
     d = np.asarray(p1, float) - np.asarray(p0, float)
     n = float(np.linalg.norm(d))
-    return MotionMeta(mid, name, tags, p0, d / n if n > 1e-6 else d, T, notes)
+    return MotionMeta(mid, name, tags, p0, d / n if n > 1e-6 else d, T, notes,
+                      end_pose=np.asarray(p1, float))
 
 
 def build_world(*, client=None, selector_cls=MotionSelector,

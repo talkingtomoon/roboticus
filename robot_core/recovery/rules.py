@@ -28,6 +28,7 @@ DEFAULT_TAG_MAP: dict[FailureType, tuple[str, str]] = {
     FailureType.PLAYBACK_STALL: ("retry", "slow"),      # 막힘 → 천천히 재시도
     FailureType.OVERHEAT: ("rest", "stop"),             # 과열 → 휴지 삽입
     FailureType.AXIS_FAULT: ("rest", "stop"),           # 축 이상 → 안전 휴지
+    FailureType.MOTION_INCOMPLETE: ("retry", "normal"), # 미도달 → 재시도
 }
 
 

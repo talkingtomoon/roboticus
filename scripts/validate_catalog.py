@@ -103,21 +103,33 @@ def validate(catalog: MotionCatalog, plan_tags: list[str],
                 f"모션 {m.id}({m.name}): initial_direction이 0 — "
                 f"annotate_motion.py 재실행 필요 (순응 채점 불가)")
 
-    # ---- 단계 간 연결 (근사) --------------------------------------------
-    # 정확한 검사에는 이전 단계의 end_pose가 필요하다 (주석 확장 예정).
-    # 근사: 연속 계획 태그의 모션 시작자세들끼리 최소 거리가 진입 필터
-    # 임계를 넘으면, 단계 사이를 이어줄 후보가 없을 가능성이 높다.
+    # ---- 단계 간 연결 ----------------------------------------------------
+    # 정밀: 이전 단계 모션의 end_pose ↔ 다음 단계 모션의 start_pose.
+    # end_pose 없는 구버전 주석만 있으면 시작자세끼리의 근사 검사로 폴백.
     for tag_a, tag_b in zip(plan_tags, plan_tags[1:]):
         ms_a, ms_b = catalog.by_tag(tag_a), catalog.by_tag(tag_b)
         if not ms_a or not ms_b:
             continue
-        dmin = min(float(np.linalg.norm(mb.start_pose - ma.start_pose))
-                   for ma in ms_a for mb in ms_b)
-        if dmin > entry_max_dist:
+        ends = [(ma, ma.end_pose) for ma in ms_a if ma.end_pose is not None]
+        if ends:
+            dmin = min(float(np.linalg.norm(mb.start_pose - ep))
+                       for _, ep in ends for mb in ms_b)
+            if dmin > entry_max_dist:
+                warnings.append(
+                    f"단계 {tag_a!r}→{tag_b!r}: 종료↔시작 자세 최소 거리 "
+                    f"{dmin:.2f} > 진입 임계 {entry_max_dist} — "
+                    f"{tag_a!r}가 끝나는 곳에서 {tag_b!r}를 시작할 수 없다")
+        else:
+            dmin = min(float(np.linalg.norm(mb.start_pose - ma.start_pose))
+                       for ma in ms_a for mb in ms_b)
+            if dmin > entry_max_dist:
+                warnings.append(
+                    f"단계 {tag_a!r}→{tag_b!r}: 시작자세 최소 거리 {dmin:.2f} > "
+                    f"진입 임계 {entry_max_dist} (근사 — end_pose 주석이 없어 "
+                    f"정밀 검사 불가. annotate_motion.py 재실행 권장)")
             warnings.append(
-                f"단계 {tag_a!r}→{tag_b!r}: 시작자세 최소 거리 {dmin:.2f} > "
-                f"진입 임계 {entry_max_dist} (근사 검사 — end_pose 주석 후 "
-                f"정밀화). 연결이 안 될 수 있다")
+                f"단계 {tag_a!r}: end_pose 주석 없음 — 도달 판정과 연결 검사가 "
+                f"판정불가로 돌아간다 (annotate_motion.py 재실행)")
 
     return errors, warnings
 

@@ -29,6 +29,7 @@
 ```
 robot_core/
   hal/         phorce.py — PhorceHAL 경계 + MockPhorceHAL(재생 시뮬 + 주입 API)
+               real_phorce.py — 파사드 래퍼 골격 (매핑 5지점 + 거절코드 변환표)
                mock.py — 12축 관절 동역학 엔진 (목의 물리)
   catalog/     motion_catalog.py — 교시 모션 메타데이터 (JSON, 적재 슬롯 대조)
   switching/   selector.py — 모션 선택기 · baselines.py — 무작위/첫슬롯
@@ -36,14 +37,14 @@ robot_core/
                safety.py(TagSafetyGuard) · rules.py(실패→태그 표)
   supervisor.py  2Hz 판단 루프 + 상태기계 (1kHz↔2Hz 분리를 구조로 강제)
   intent/      sources.py(Typed/Whisper) · interpreter.py — 사람의 말 → 태그
-  ui/          server.py + static/ — 운용 웹 UI (FastAPI, html 한 장 + 1초 폴링)
+  ui/          server.py + static/(대시보드·/op) + guidance.py(안내 번역표)
   logging/     feedback_cache.py — 1kHz 수신과 판단 사이의 유일한 접점
   integration/ scenarios.py(리허설 5종) · timeline.py(단일 시간축)
   adapters/    phorce_ros2.py — rclpy 주석 스켈레톤 (qos_profile_sensor_data 필수)
   legacy/      임피던스 인터페이스 시절 스냅샷 (참고용 — 삭제 아님)
 scripts/       annotate_motion.py · validate_catalog.py · field_smoke.py ·
                baseline_selector_comparison.py · check_llm_model.py · legacy/
-tests/         186개 테스트, 실물·실제 API 없이 전부 통과
+tests/         211개 테스트, 실물·실제 API 없이 전부 통과
 examples/      demo_full_rehearsal.py · legacy/
 ```
 
@@ -54,7 +55,7 @@ git clone https://github.com/talkingtomoon/roboticus.git
 cd roboticus
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
-python -m pytest -q                                  # 186 tests
+python -m pytest -q                                  # 211 tests
 python examples/demo_full_rehearsal.py               # 리허설 시나리오 5종
 ```
 
@@ -100,6 +101,7 @@ LLM 경로를 쓰려면 `pip install anthropic` + `ANTHROPIC_API_KEY` — **없�
 | `PLAYBACK_STALL` | 재생 중 + 전 축 정지 + 전류로 밀고 있음 (물체에 막힘) | `retry` + slow |
 | `OVERHEAT` | temp_c 지속 초과. 해제 시 `OVERHEAT_CLEARED` 짝 발행 | `rest` + stop |
 | `AXIS_FAULT` | fault 비트 | `rest` + stop |
+| `MOTION_INCOMPLETE` | 재생은 끝났지만 실제 자세가 교시 end_pose에서 멂 (**완료 ≠ 성공** — 계획 미전진, 브레이커 집계 포함) | `retry` |
 
 히스테리시스/최소지속/refractory/lookback 구조는 구 감지기에서 그대로.
 **IMPACT lookback(0.7s)은 판단 주기(0.5s)보다 길다** — 폴 사이에 끝난 짧은
@@ -158,7 +160,7 @@ python -m robot_core.integration.scenarios --scenario S5   # 타임라인 포함
 |---|---|---|---|
 | 0 | 짐 풀기 전 — 전체 테스트/리허설이 지금도 도는지 | `pytest -q` + `python examples/demo_full_rehearsal.py` | 5분 |
 | 1 | **현장 호환성 스모크** — 파사드 가정 6개 실측 (sim:demo 대상) | `python scripts/field_smoke.py` | 10분 |
-| 2 | RealPhorceHAL 작성 — 파사드를 PhorceHAL 인터페이스로 래핑 (스모크가 깨진 가정의 코드 위치를 알려준다) | [robot_core/hal/phorce.py](robot_core/hal/phorce.py) `PhorceHAL` 계약 | 30–60분 |
+| 2 | RealPhorceHAL 완성 — 매핑 5지점(M1~M5)만 채우면 됨. 각 지점에 검증 스모크 항목(A1~A6) 명시돼 있음 | [robot_core/hal/real_phorce.py](robot_core/hal/real_phorce.py) | 30–60분 |
 | 3 | 교시된 모션 주석 달기 (모션당 1회 재생) | `python scripts/annotate_motion.py --id N --name ... --tags ...` | 모션당 2분 |
 | 3.5 | **교시 세션 끝나기 전에** 카탈로그·계획 정적 검증 (오타/커버리지/회피 양방향/모션 길이) — 문제는 지금 알아야 다시 가르칠 시간이 있다 | `python scripts/validate_catalog.py --catalog catalog.json --plan approach,insert,...` | 2분 |
 | 4 | 감지 임계 반영 — 스모크 A6이 제안한 값으로 | [recovery/detector.py](robot_core/recovery/detector.py) `DetectorConfig` | 5분 |
@@ -209,6 +211,17 @@ html 한 장 + 1초 폴링 (웹소켓/프레임워크 없음). 구성:
 Supervisor 결합은 공개 메서드 4개뿐: `snapshot()`(뷰 전용) / `halt()` /
 `resume()` / `request_intent()`. phorce-console과 중복되는 실시간 그래프·축별
 상세는 만들지 않는다.
+
+### 운용자용 간이 페이지 (/op)
+
+시스템을 모르는 팀원이 로봇 옆에서 쓰는 페이지 — "지금 무슨 상황이고 내가
+뭘 하면 되는지"를 큰 글씨 한 화면으로. 상태 문장(시스템 용어 없음) + 행동
+카드(거절 12: "1번 버튼 0.6초", 13: "2번 버튼 파킹", 워치독: "케이블 확인",
+E-stop: "전원 재시작 필요" 등) + [🛑 멈춰][▶ 재개][✅ 해결했어요] + 자주 쓰는
+명령 버튼. **문구는 전부 서버(/api/guidance)의 번역표
+[ui/guidance.py](robot_core/ui/guidance.py) 한 곳에서** — 프런트 하드코딩 없음.
+번역표에 없는 상태/코드는 "운영 담당자를 불러주세요" + 원본 코드.
+단발 미도달은 표시하지 않는다 (반복돼 브레이커가 가까울 때만 안내).
 
 완료 기준 시나리오가 통합 테스트로 고정돼 있다: 텍스트 "천천히 다시 해봐" →
 키워드 해석(retry/slow) → 가드 통과 → 다음 경계에서 slow 변주 선곡 —

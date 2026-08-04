@@ -31,6 +31,10 @@ class MotionMeta:
     initial_direction: np.ndarray   # (12,) 초기 이동 방향 (정규화, 정지 출발 대응)
     duration_s: float
     notes: str = ""
+    # 교시 종료 자세. "완료 ≠ 성공" 판정의 기준 — 재생이 (시간상) 끝나도
+    # 실제 자세가 여기서 멀면 MOTION_INCOMPLETE다.
+    # None = 구버전 주석 (판정불가로 처리, 하위호환)
+    end_pose: np.ndarray | None = None
 
     def __post_init__(self):
         self.id = int(self.id)
@@ -39,16 +43,23 @@ class MotionMeta:
         self.tags = [str(t) for t in self.tags]
         self.start_pose = np.asarray(self.start_pose, dtype=float)
         self.initial_direction = np.asarray(self.initial_direction, dtype=float)
-        for name, arr in (("start_pose", self.start_pose),
-                          ("initial_direction", self.initial_direction)):
+        checks = [("start_pose", self.start_pose),
+                  ("initial_direction", self.initial_direction)]
+        if self.end_pose is not None:
+            self.end_pose = np.asarray(self.end_pose, dtype=float)
+            checks.append(("end_pose", self.end_pose))
+        for name, arr in checks:
             if arr.shape != (N_AXES,):
                 raise ValueError(f"motion {self.id} {name}: shape {arr.shape} != ({N_AXES},)")
 
     def to_dict(self) -> dict:
-        return {"name": self.name, "tags": list(self.tags),
-                "start_pose": [round(float(x), 5) for x in self.start_pose],
-                "initial_direction": [round(float(x), 5) for x in self.initial_direction],
-                "duration_s": round(float(self.duration_s), 3), "notes": self.notes}
+        d = {"name": self.name, "tags": list(self.tags),
+             "start_pose": [round(float(x), 5) for x in self.start_pose],
+             "initial_direction": [round(float(x), 5) for x in self.initial_direction],
+             "duration_s": round(float(self.duration_s), 3), "notes": self.notes}
+        if self.end_pose is not None:
+            d["end_pose"] = [round(float(x), 5) for x in self.end_pose]
+        return d
 
 
 class MotionCatalog:
@@ -124,7 +135,8 @@ class MotionCatalog:
             cat.add(MotionMeta(
                 id=int(sid), name=d["name"], tags=d["tags"],
                 start_pose=d["start_pose"], initial_direction=d["initial_direction"],
-                duration_s=float(d["duration_s"]), notes=d.get("notes", "")))
+                duration_s=float(d["duration_s"]), notes=d.get("notes", ""),
+                end_pose=d.get("end_pose")))   # 구버전 JSON엔 없다 → None
         return cat
 
 
@@ -147,6 +159,7 @@ def annotate_from_recording(motion_id: int, name: str, tags: list[str],
     duration = float(t[e] - t[s])
 
     start_pose = arrays["position"][s].copy()
+    end_pose = arrays["position"][e].copy()      # 종료 자세 — 도달 판정 기준
     k = s + max(2, int((e - s) * direction_window_frac))
     disp = arrays["position"][k] - start_pose
     # invalid 축은 방향 정보 없음 → 0
@@ -156,4 +169,5 @@ def annotate_from_recording(motion_id: int, name: str, tags: list[str],
     direction = disp / norm if norm > 1e-6 else np.zeros_like(disp)
 
     return MotionMeta(id=motion_id, name=name, tags=tags, start_pose=start_pose,
-                      initial_direction=direction, duration_s=duration, notes=notes)
+                      initial_direction=direction, duration_s=duration,
+                      notes=notes, end_pose=end_pose)

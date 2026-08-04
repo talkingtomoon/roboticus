@@ -132,7 +132,7 @@
 </div>
 
 <div class="card">
-  <h3>최근 선곡 점수표</h3>
+  <h3>최근 선곡 점수표 <span id="arrivalBadge"></span></h3>
   <div id="score">(아직 없음)</div>
 </div>
 
@@ -155,6 +155,12 @@
 // detect→감지, guard→가드, select→선곡, play→재생, intent→해석
 function classify(text) {
   // returns {node, blocked, label, cls} — cls는 타임라인 색상용
+  if (text.startsWith("DETECTED MOTION_INCOMPLETE")) {
+    // 완료됐지만 실패한 케이스 — 재생 노드에 차단색
+    const m = text.match(/joint=(\d+).*err_rad=([\d.]+)/);
+    return {node:"play", blocked:true, cls:"detect",
+            label: m ? `미도달 j${m[1]} ${m[2]}rad` : "미도달"};
+  }
   if (text.startsWith("DETECTED")) {
     const m = text.match(/DETECTED (\w+) joint=(\d+)/);
     return {node:"detect", blocked:false, cls:"detect",
@@ -259,6 +265,17 @@ function renderState(st) {
   const br = Object.entries(st.breaker || {});
   if (br.length) bits.push("브레이커 " + br.map(([k,v]) => `${k}×${v}`).join(","));
   document.getElementById("meta").textContent = bits.join("  ·  ");
+  // 직전 모션 도달 판정 뱃지 (완료 ≠ 성공)
+  const ab = document.getElementById("arrivalBadge");
+  const la = st.last_arrival;
+  if (!la) ab.textContent = "";
+  else if (la.status === "ok")
+    ab.innerHTML = `<span style="color:var(--green)">✓ 도달 (#${la.motion_id})</span>`;
+  else if (la.status === "incomplete")
+    ab.innerHTML = `<span style="color:var(--red)">⚠ 미도달 (#${la.motion_id}, ` +
+                   `${la.err_rad}rad j${la.axis})</span>`;
+  else
+    ab.innerHTML = `<span style="color:var(--dim)">– 판정불가 (#${la.motion_id})</span>`;
   document.getElementById("diagramWrap").classList.toggle(
     "halted", st.state === "HALTED");
   // 피드백 노드: 신선하면 은은히 활성

@@ -30,11 +30,35 @@ class HaltBody(BaseModel):
 
 
 def create_app(supervisor, interpreter=None, typed_source=None) -> FastAPI:
+    from robot_core.ui.guidance import compute_guidance
+
     app = FastAPI(title="robot_core 운용 UI", docs_url=None, redoc_url=None)
 
     @app.get("/")
     def index():
         return FileResponse(STATIC_DIR / "index.html")
+
+    @app.get("/op")
+    def op_page():
+        """운용자용 간이 페이지 — 시스템을 모르는 팀원용."""
+        return FileResponse(STATIC_DIR / "op.html")
+
+    @app.get("/api/guidance")
+    def guidance():
+        """현재 상태 + 최근 이벤트 → 사람 행동 지시 (번역표는 guidance.py 한 곳)."""
+        events = [{"t": e.t, "text": e.text}
+                  for e in supervisor.cache.events()]
+        return compute_guidance(supervisor.snapshot(), events)
+
+    @app.post("/api/operator_cleared")
+    def operator_cleared():
+        """[해결했어요] — WAITING_OPERATOR에서만 유효."""
+        if supervisor.state.value != "WAITING_OPERATOR":
+            return JSONResponse(
+                {"error": "지금은 해결할 것이 없어요 (WAITING_OPERATOR 아님)",
+                 "state": supervisor.state.value}, status_code=403)
+        supervisor.operator_cleared()
+        return {"state": supervisor.snapshot()["state"]}
 
     @app.get("/api/state")
     def state():
