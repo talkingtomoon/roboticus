@@ -1,24 +1,25 @@
-"""실패 감지기.
+"""실패 감지기 — phorce 피드백 프레임(FeedbackCache.to_arrays()) 기준.
 
-RingLogger.to_arrays()의 원본 배열로 판정한다. dump_text()에는 의존하지 않는다.
+네 종류를 감지한다:
+- PLAYBACK_STALL : 재생 중인데 전 축이 정지 + 전류는 밀고 있음 (물체에 막힘)
+- IMPACT         : dob_a(외란 관측기) 스파이크 — 자체 추정 코드는 제거했다,
+                   하드웨어 DOB가 정본이다
+- OVERHEAT       : temp_c 임계 초과 지속 (연속 과부하의 phorce 버전).
+                   해제 시 OVERHEAT_CLEARED를 짝으로 발행 (복귀 트리거)
+- AXIS_FAULT     : fault 비트 발화
 
-세 종류를 감지한다 (토크 임계치 하나로는 절반을 놓친다 — 이전 단계에서 확인:
-이미 목표에 도달해 정지한 관절이 걸리면 PD 오차가 없어 토크가 안 튄다):
+모든 판정의 전제: valid 마스크. valid=False(또는 stale) 축은 수치를 신뢰할 수
+없으므로 **판정에서 제외**한다 (없는 셈 친다 — 오검출도 미검출도 아닌 '모름').
 
-- TORQUE_SPIKE : |tau| > threshold 가 min_duration 이상 지속 (움직이다 걸림)
-- STALL        : |q_des - q| 큰데 |qd| ≈ 0 이 min_duration 이상 지속
-                 (정지 중 고착을 잡는 유일한 수단)
-- OSCILLATION  : 유의미한 진폭의 qd 부호 반전이 고주파로 반복 (게인 과다)
-
-오탐 방지 장치:
-- 최소 지속 시간: 판정 조건이 트레일링 윈도우 전체에서 성립해야 발동
-- 히스테리시스: 발동 후 조건이 release 수준 밑으로 내려가야 재무장
-- refractory: 같은 (타입, 관절)은 최소 간격 안에 재발동 금지
+오탐 방지 구조는 구 감지기에서 그대로 가져왔다:
+- 최소 지속 시간 / lookback 구간 스캔 (폴링 위상 무관)
+- 히스테리시스 (release 수준 밑으로 내려가야 재무장)
+- refractory (같은 (타입,축) 재발동 최소 간격)
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -27,37 +28,32 @@ from robot_core.recovery.events import FailureEvent, FailureType
 
 @dataclass
 class DetectorConfig:
-    # TORQUE_SPIKE
-    torque_threshold: float | np.ndarray = 15.0  # [Nm] 관절별 또는 스칼라
-    torque_min_duration_s: float = 0.02
-    torque_release_frac: float = 0.7   # 재무장: |tau|가 threshold*frac 밑으로
-    # 충격 과도신호는 짧다 (kd 댐핑이 ms 단위로 상쇄). 폴링 주기와 무관하게
-    # 잡으려면 "지금 이 순간 초과 중"이 아니라 "최근 lookback 안에 min_duration
-    # 이상 지속된 초과 구간이 있었나"를 봐야 한다.
-    torque_lookback_s: float = 0.15
+    # IMPACT — dob_a 스파이크 (임계 기본값은 목 스케일. 실물은
+    # scripts/field_smoke.py가 30초 분포를 재서 제안하는 값으로 교체)
+    impact_dob_threshold: float | np.ndarray = 3.0   # [A]
+    impact_min_duration_s: float = 0.008
+    impact_release_frac: float = 0.7
+    # lookback은 **판단 루프 주기(~0.5s)보다 길어야 한다** — 2Hz 폴 사이에
+    # 끝나버린 짧은 충격도 다음 폴에서 구간 스캔으로 잡는다 (last_fire_t
+    # 가드가 같은 구간의 재발동을 막는다)
+    impact_lookback_s: float = 0.7
 
-    # STALL
-    stall_err_threshold: float = 0.1   # [rad] 지령-실제 오차
-    stall_qd_eps: float = 0.05         # [rad/s] "안 움직임" 판정
-    stall_min_duration_s: float = 0.25
-    stall_release_frac: float = 0.5    # 재무장: 오차가 threshold*frac 밑으로
+    # PLAYBACK_STALL — 재생 중 + 정지 + 전류로 밀고 있음
+    stall_vel_eps: float = 0.05        # [rad/s] "안 움직임"
+    stall_current_floor: float = 1.0   # [A] "밀고 있음" (없으면 의도된 정지 동작)
+    stall_min_duration_s: float = 0.30
 
-    # OSCILLATION
-    osc_qd_amp_eps: float = 0.3        # [rad/s] 이 진폭 넘는 반전만 센다
-    osc_min_flips_hz: float = 8.0      # 초당 부호 반전 수
-    osc_window_s: float = 0.3
-    osc_release_frac: float = 0.5
+    # OVERHEAT — 지속 판정 (스파이크가 아니라 열)
+    overheat_temp_c: float = 70.0
+    overheat_min_duration_s: float = 0.5
+    overheat_release_c: float = 62.0   # 이 밑으로 내려와야 해제(CLEARED 발행)
 
-    # CONTINUOUS_OVERLOAD — 지속 과부하 (열 예산)
-    # 순간 상한이 아니라 이동평균 예산이다. 신호는 tau_cmd(지령 토크)를 쓴다:
-    # 외란과 맞서는 홀드는 출력측 순토크가 0이라 tau_measured로는 안 보이지만
-    # 모터 전류(발열)는 지령 쪽에 흐른다. tau_cmd가 없으면 tau로 폴백.
-    cont_budget: float | np.ndarray | None = None   # [Nm] None = 채널 비활성
-    cont_window_s: float = 1.0
-    cont_release_frac: float = 0.9     # 평균이 budget*frac 밑이면 해제
+    # AXIS_FAULT — 즉시 (비트가 곧 판정)
+    fault_min_duration_s: float = 0.003
 
     # 공통
-    refractory_s: float = 1.0          # 같은 (타입,관절) 재발동 최소 간격 (로봇 클록)
+    refractory_s: float = 1.0
+    valid_min_frames: int = 5          # 창 안에서 이보다 적게 valid면 그 축 판정 보류
 
 
 @dataclass
@@ -78,103 +74,47 @@ def _runs(mask: np.ndarray) -> list[tuple[int, int]]:
 
 
 class FailureDetector:
-    """check(arrays)를 주기적으로 (예: 20Hz) 불러 이벤트 리스트를 받는다."""
+    """check(arrays)를 느린 루프(~2Hz)에서 불러 이벤트 리스트를 받는다."""
 
-    def __init__(self, n_joints: int, config: DetectorConfig | None = None) -> None:
-        self.n = int(n_joints)
+    def __init__(self, n_axes: int = 12, config: DetectorConfig | None = None) -> None:
+        self.n = int(n_axes)
         self.cfg = config or DetectorConfig()
-        thr = np.asarray(self.cfg.torque_threshold, dtype=float)
-        self._tau_thr = np.full(self.n, float(thr)) if thr.ndim == 0 else thr.copy()
-        if self._tau_thr.shape != (self.n,):
-            raise ValueError(f"torque_threshold shape {thr.shape}, expected ({self.n},)")
+        thr = np.asarray(self.cfg.impact_dob_threshold, dtype=float)
+        self._dob_thr = np.full(self.n, float(thr)) if thr.ndim == 0 else thr.copy()
+        if self._dob_thr.shape != (self.n,):
+            raise ValueError(f"impact_dob_threshold shape {thr.shape} != ({self.n},)")
         self._state: dict[tuple[str, int], _ChannelState] = {}
-        if self.cfg.cont_budget is not None:
-            cb = np.asarray(self.cfg.cont_budget, dtype=float)
-            self._cont_budget = np.full(self.n, float(cb)) if cb.ndim == 0 else cb.copy()
-        else:
-            self._cont_budget = None
-        self._in_overload = np.zeros(self.n, dtype=bool)
+        self._in_overheat = np.zeros(self.n, dtype=bool)
 
     def _chan(self, ftype: FailureType, j: int) -> _ChannelState:
         return self._state.setdefault((ftype.value, j), _ChannelState())
 
     def reset(self) -> None:
         self._state.clear()
+        self._in_overheat[:] = False
 
     # ------------------------------------------------------------------ 판정
     def check(self, arrays: dict) -> list[FailureEvent]:
-        """RingLogger.to_arrays() 결과를 받아 새로 발동한 이벤트를 돌려준다."""
         t = arrays["t"]
         if len(t) < 3:
             return []
         events: list[FailureEvent] = []
-        events += self._check_torque(arrays)
-        events += self._check_stall(arrays)
-        events += self._check_oscillation(arrays)
-        events += self._check_continuous_overload(arrays)
+        events += self._check_impact(arrays)
+        events += self._check_playback_stall(arrays)
+        events += self._check_overheat(arrays)
+        events += self._check_axis_fault(arrays)
         return events
 
     def _trailing(self, t: np.ndarray, duration: float) -> np.ndarray:
-        """끝에서 duration만큼의 샘플 마스크."""
         return t >= (t[-1] - duration)
 
-    def _check_continuous_overload(self, a: dict) -> list[FailureEvent]:
-        """지령 토크 1초 이동평균 > 연속 예산 → CONTINUOUS_OVERLOAD.
-        예산 밑으로 회복(release_frac)하면 OVERLOAD_CLEARED를 짝으로 발행.
+    def _axis_ok(self, valid_col: np.ndarray) -> bool:
+        """창 안에서 이 축을 판정에 써도 되는가 (valid 전제)."""
+        return int(valid_col.sum()) >= self.cfg.valid_min_frames
 
-        신호: tau_cmd (클램프 적용 후 지령 — 로거가 잘라서 기록). 클램프에
-        눌린 구간에서 지령 원값을 쓰면 실제 발열을 과대평가해 불필요한
-        slow-down이 걸린다. tau_cmd가 없으면(명령 미기록) tau로 폴백.
-        """
-        if self._cont_budget is None:
-            return []
-        t = a["t"]
-        if t[-1] - t[0] < self.cfg.cont_window_s:   # 창이 덜 찼으면 판정 보류
-            return []
-        sig = a.get("tau_cmd")
-        if sig is None or not np.any(np.isfinite(sig)):
-            sig = a["tau"]
-        m = self._trailing(t, self.cfg.cont_window_s)
-        window = np.abs(sig[m])
-        # 명령이 안 찍힌 행(nan)은 평균에서 제외 (all-nan 관절은 판정 보류)
-        finite = np.isfinite(window)
-        cnt = finite.sum(axis=0)
-        avg = np.where(cnt > 0,
-                       np.where(finite, window, 0.0).sum(axis=0) / np.maximum(cnt, 1),
-                       np.nan)
-
-        out: list[FailureEvent] = []
-        now = float(t[-1])
-        for j in range(self.n):
-            budget = self._cont_budget[j]
-            if not np.isfinite(avg[j]):
-                continue
-            if not self._in_overload[j]:
-                ev = self._try_fire(
-                    FailureType.CONTINUOUS_OVERLOAD, j, now,
-                    condition=bool(avg[j] > budget),
-                    release=bool(avg[j] < budget * self.cfg.cont_release_frac),
-                    severity=min(1.0, (avg[j] / budget - 1.0) * 2 + 0.3),
-                    snapshot={"tau_avg_1s": float(avg[j]), "budget": float(budget),
-                              "window_s": float(self.cfg.cont_window_s)},
-                )
-                if ev:
-                    self._in_overload[j] = True
-                    out.append(ev)
-            else:
-                if avg[j] < budget * self.cfg.cont_release_frac:
-                    self._in_overload[j] = False
-                    out.append(FailureEvent(
-                        type=FailureType.OVERLOAD_CLEARED, joint_idx=j,
-                        severity=0.0, t=now,
-                        snapshot={"tau_avg_1s": float(avg[j]),
-                                  "budget": float(budget)}))
-        return out
-
-    def _try_fire(
-        self, ftype: FailureType, j: int, now: float,
-        condition: bool, release: bool, severity: float, snapshot: dict,
-    ) -> FailureEvent | None:
+    def _try_fire(self, ftype: FailureType, j: int, now: float,
+                  condition: bool, release: bool, severity: float,
+                  snapshot: dict) -> FailureEvent | None:
         ch = self._chan(ftype, j)
         if not ch.armed:
             if release:
@@ -186,123 +126,133 @@ class FailureDetector:
             return None
         ch.armed = False
         ch.last_fire_t = now
-        return FailureEvent(
-            type=ftype, joint_idx=j, severity=float(np.clip(severity, 0.0, 1.0)),
-            t=now, snapshot=snapshot,
-        )
+        return FailureEvent(type=ftype, joint_idx=j, severity=min(1.0, severity),
+                            t=now, snapshot=snapshot)
 
-    def _check_torque(self, a: dict) -> list[FailureEvent]:
-        """lookback 창 안에서 min_duration 이상 지속된 초과 '구간'을 찾는다.
-
-        말미 창만 보면 짧은 충격 과도신호(수십 ms)를 폴링 위상에 따라 놓친다.
-        이미 발동에 쓰인 과거 구간의 재발동은 last_fire_t 이후에 끝난 구간만
-        인정하는 것으로 막는다.
-        """
-        t, tau = a["t"], a["tau"]
-        m = self._trailing(t, max(self.cfg.torque_lookback_s,
-                                  self.cfg.torque_min_duration_s))
-        if m.sum() < 2:
-            return []
+    # ------------------------------------------------------------- IMPACT
+    def _check_impact(self, a: dict) -> list[FailureEvent]:
+        """lookback 창에서 min_duration 이상 지속된 |dob| 초과 구간을 찾는다."""
+        t, dob, valid = a["t"], a["dob"], a["valid"]
+        m = self._trailing(t, max(self.cfg.impact_lookback_s,
+                                  self.cfg.impact_min_duration_s))
         t_win = t[m]
         out = []
         for j in range(self.n):
-            thr = self._tau_thr[j]
-            ch = self._chan(FailureType.TORQUE_SPIKE, j)
-            win = np.abs(tau[m, j])
-            above = win > thr
+            v = valid[m, j]
+            if not self._axis_ok(v):
+                continue
+            thr = self._dob_thr[j]
+            ch = self._chan(FailureType.IMPACT, j)
+            sig = np.where(v, np.abs(dob[m, j]), 0.0)   # invalid 샘플은 0 취급
+            above = sig > thr
 
-            # last_fire 이후에 끝난, min_duration 이상 지속된 초과 구간이 있는가
-            condition = False
-            peak = 0.0
-            run_dur = 0.0
-            for start, end in _runs(above):
-                dur = float(t_win[end] - t_win[start])
-                if dur >= self.cfg.torque_min_duration_s and t_win[end] > ch.last_fire_t:
+            condition, peak, run_dur = False, 0.0, 0.0
+            for s, e in _runs(above):
+                dur = float(t_win[e] - t_win[s])
+                if dur >= self.cfg.impact_min_duration_s and t_win[e] > ch.last_fire_t:
                     condition = True
                     run_dur = max(run_dur, dur)
-                    peak = max(peak, float(win[start:end + 1].max()))
+                    peak = max(peak, float(sig[s:e + 1].max()))
 
-            # 재무장: 최근 min_duration 동안 조용해졌는가
-            tail = t_win >= t_win[-1] - self.cfg.torque_min_duration_s
-            release = bool(win[tail].max() < thr * self.cfg.torque_release_frac)
+            tail = t_win >= t_win[-1] - self.cfg.impact_min_duration_s
+            release = bool(sig[tail].max() < thr * self.cfg.impact_release_frac)
 
             ev = self._try_fire(
-                FailureType.TORQUE_SPIKE, j, float(t[-1]), condition, release,
-                severity=min(1.0, (peak / thr - 1.0) * 2 + 0.5) if peak else 0.0,
-                snapshot={
-                    "tau_now": float(tau[-1, j]), "tau_peak_window": peak,
-                    "threshold": float(thr), "duration_s": run_dur,
-                },
-            )
+                FailureType.IMPACT, j, float(t[-1]), condition, release,
+                severity=(peak / thr - 1.0) * 2 + 0.5 if peak else 0.0,
+                snapshot={"dob_peak": peak, "threshold": float(thr),
+                          "duration_s": run_dur,
+                          "dob_now": float(dob[-1, j]) if valid[-1, j] else float("nan")})
             if ev:
                 out.append(ev)
         return out
 
-    def _check_stall(self, a: dict) -> list[FailureEvent]:
-        t, q, qd, q_des = a["t"], a["q"], a["qd"], a["q_des"]
-        if not np.any(np.isfinite(q_des)):
-            return []  # 지령이 기록 안 됐으면 판정 불가
+    # ------------------------------------------------------ PLAYBACK_STALL
+    def _check_playback_stall(self, a: dict) -> list[FailureEvent]:
+        """재생 중인데 valid 전 축이 정지 + 전류는 밀고 있음 → 막힘.
+
+        축 단위가 아니라 '프레임 단위' 판정이다: 모션에는 의도된 개별 축 정지가
+        흔하므로, "전류가 흐르는데 아무 축도 안 움직인다"가 막힘의 신호다.
+        발화는 전류가 가장 큰 축(=미는 축)에 귀속시킨다.
+        """
+        t = a["t"]
         m = self._trailing(t, self.cfg.stall_min_duration_s)
+        if m.sum() < 5 or not bool(a["playing"][m].all()):
+            return []   # 창 전체가 재생 중이어야 판정
+        vel, cur, valid = a["velocity"][m], a["current"][m], a["valid"][m]
+
+        # invalid 축 제외한 프레임별 최대 속도/전류
+        vel_ok = np.where(valid, np.abs(vel), 0.0)
+        cur_ok = np.where(valid, np.abs(cur), 0.0)
+        if not self._axis_ok(valid.any(axis=1)):
+            return []
+        frozen = bool((vel_ok.max(axis=1) < self.cfg.stall_vel_eps).all())
+        pushing = bool((cur_ok.max(axis=1) > self.cfg.stall_current_floor).all())
+
+        j = int(cur_ok[-1].argmax())
+        release = not frozen
+        ev = self._try_fire(
+            FailureType.PLAYBACK_STALL, j, float(t[-1]),
+            condition=frozen and pushing, release=release,
+            severity=0.5 + 0.5 * min(1.0, cur_ok[-1].max()
+                                     / max(self.cfg.stall_current_floor, 1e-9) - 1.0),
+            snapshot={"vel_max": float(vel_ok.max()),
+                      "current_max": float(cur_ok.max()),
+                      "vel_eps": self.cfg.stall_vel_eps,
+                      "current_floor": self.cfg.stall_current_floor,
+                      "duration_s": self.cfg.stall_min_duration_s})
+        return [ev] if ev else []
+
+    # ------------------------------------------------------------ OVERHEAT
+    def _check_overheat(self, a: dict) -> list[FailureEvent]:
+        t, temp, valid = a["t"], a["temp"], a["valid"]
+        m = self._trailing(t, self.cfg.overheat_min_duration_s)
         if m.sum() < 3:
             return []
-        window_span = float(t[m][-1] - t[m][0])
-        # |qd| < eps 인 창에서 관절이 실제로 진행할 수 있는 최대 거리.
-        # 이보다 많이 줄었다면 (천천히라도) 가고 있는 것이므로 스톨이 아니다.
-        max_progress = self.cfg.stall_qd_eps * window_span
         out = []
+        now = float(t[-1])
         for j in range(self.n):
-            err = q_des[m, j] - q[m, j]
-            if not np.all(np.isfinite(err)):
+            v = valid[m, j]
+            if not self._axis_ok(v):
                 continue
-            abs_err = np.abs(err)
-            speed = np.abs(qd[m, j])
-            condition = bool(
-                np.all(abs_err > self.cfg.stall_err_threshold)
-                and np.all(speed < self.cfg.stall_qd_eps)
-                and abs_err[-1] >= abs_err[0] - max_progress
-            )
-            release = bool(abs_err[-1] < self.cfg.stall_err_threshold * self.cfg.stall_release_frac)
-            ev = self._try_fire(
-                FailureType.STALL, j, float(t[-1]), condition, release,
-                severity=min(1.0, float(abs_err[-1]) / (self.cfg.stall_err_threshold * 4)),
-                snapshot={
-                    "q_now": float(q[-1, j]), "q_des_now": float(q_des[-1, j]),
-                    "err": float(err[-1]), "qd_mean_abs": float(speed.mean()),
-                    "err_threshold": self.cfg.stall_err_threshold,
-                    "duration_s": self.cfg.stall_min_duration_s,
-                },
-            )
-            if ev:
-                out.append(ev)
+            col = temp[m, j][v]
+            hot = bool((col > self.cfg.overheat_temp_c).all())
+            cooled = bool(col[-1] < self.cfg.overheat_release_c)
+
+            if not self._in_overheat[j]:
+                ev = self._try_fire(
+                    FailureType.OVERHEAT, j, now, condition=hot, release=True,
+                    severity=0.5 + (float(col[-1]) - self.cfg.overheat_temp_c) / 20.0,
+                    snapshot={"temp_now": float(col[-1]),
+                              "threshold_c": self.cfg.overheat_temp_c,
+                              "release_c": self.cfg.overheat_release_c})
+                if ev:
+                    self._in_overheat[j] = True
+                    out.append(ev)
+            elif cooled:
+                self._in_overheat[j] = False
+                out.append(FailureEvent(
+                    type=FailureType.OVERHEAT_CLEARED, joint_idx=j, severity=0.0,
+                    t=now, snapshot={"temp_now": float(col[-1]),
+                                     "release_c": self.cfg.overheat_release_c}))
         return out
 
-    def _check_oscillation(self, a: dict) -> list[FailureEvent]:
-        t, qd = a["t"], a["qd"]
-        m = self._trailing(t, self.cfg.osc_window_s)
-        if m.sum() < 4:
-            return []
-        window_span = float(t[m][-1] - t[m][0])
-        if window_span <= 0:
-            return []
+    def overheat_active(self) -> bool:
+        return bool(self._in_overheat.any())
+
+    # ---------------------------------------------------------- AXIS_FAULT
+    def _check_axis_fault(self, a: dict) -> list[FailureEvent]:
+        t, fault, valid = a["t"], a["fault"], a["valid"]
+        m = self._trailing(t, max(self.cfg.fault_min_duration_s, 0.003))
         out = []
         for j in range(self.n):
-            v = qd[m, j]
-            # 진폭이 작은 잔떨림은 무시: |qd| > amp_eps인 구간의 부호만 센다
-            sign = np.where(np.abs(v) > self.cfg.osc_qd_amp_eps, np.sign(v), 0.0)
-            nz = sign[sign != 0]
-            flips = int(np.count_nonzero(np.diff(nz) != 0)) if nz.size >= 2 else 0
-            flips_hz = flips / window_span
-            condition = flips_hz >= self.cfg.osc_min_flips_hz
-            release = flips_hz < self.cfg.osc_min_flips_hz * self.cfg.osc_release_frac
+            # fault 비트는 valid와 무관하게 신뢰 (드라이버가 직접 세우는 비트)
+            active = bool(fault[m, j].all()) and m.sum() >= 2
+            release = not bool(fault[-1, j])
             ev = self._try_fire(
-                FailureType.OSCILLATION, j, float(t[-1]), condition, release,
-                severity=min(1.0, flips_hz / (self.cfg.osc_min_flips_hz * 3)),
-                snapshot={
-                    "flips_hz": float(flips_hz), "qd_amp_max": float(np.abs(v).max()),
-                    "flips_hz_threshold": self.cfg.osc_min_flips_hz,
-                    "window_s": self.cfg.osc_window_s,
-                },
-            )
+                FailureType.AXIS_FAULT, j, float(t[-1]), condition=active,
+                release=release, severity=1.0,
+                snapshot={"fault": True, "valid_now": bool(valid[-1, j])})
             if ev:
                 out.append(ev)
         return out

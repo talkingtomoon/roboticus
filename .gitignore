@@ -14,3 +14,4 @@ dist/
 calib_out/
 calibration_data.npz
 *_model.npz
+field_smoke_report.txt

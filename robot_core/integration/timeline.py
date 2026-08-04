@@ -33,6 +33,12 @@ def build_timeline(logger=None, switch_node=None, guard=None,
                 src, text = "interlock", text[len("interlock:"):].strip()
             elif text.startswith("recovery"):
                 src = "recovery"
+            elif text.startswith("select:"):
+                src, text = "select", text[len("select:"):].strip()
+            elif text.startswith("play"):
+                src = "play"
+            elif text.startswith("operator"):
+                src = "operator"
             else:
                 src = "event"
             entries.append(TimelineEntry(t=ev.t, source=src, text=text))
@@ -55,8 +61,10 @@ def build_timeline(logger=None, switch_node=None, guard=None,
 
 
 def _source_rank(source: str) -> int:
-    order = {"detect": 0, "interlock": 1, "switch": 2, "recovery": 3,
-             "guard": 4, "event": 5}
+    # 같은 시각 내 순서: 감지 → 회복 → 가드 → 나머지(캐시 삽입 순서 보존 —
+    # 파이썬 정렬은 stable이라 rank가 같으면 원래 순서가 유지된다)
+    order = {"detect": 0, "interlock": 1, "recovery": 2, "guard": 3,
+             "select": 5, "switch": 5, "play": 5, "operator": 5, "event": 5}
     return order.get(source, 9)
 
 

@@ -1,7 +1,10 @@
-"""캠프 데모용 시나리오 5종 — 전부 결정적 (n_steps 기준, 시드 고정, 벽시계 비의존).
+"""캠프 데모용 시나리오 5종 — phorce "관찰 → 판단 → 선곡" 판.
 
-각 시나리오는 ScenarioResult(성공 판정 자동화 + 타임라인)를 돌려준다.
-실행: python -m robot_core.integration.scenarios [--scenario S2]
+전부 결정적: 시뮬 스텝 수 기준, 시드 고정, 벽시계 비의존.
+실행: python -m robot_core.integration.scenarios [--scenario S3]
+
+공통 월드: 12축 목 phorce 로봇 + 교시 모션 8개(접근/삽입/복귀/우회/저속/휴지).
+판단 틱과 시뮬 스텝을 2Hz로 교차(tick 1회 ↔ 0.5s = 500스텝).
 """
 
 from __future__ import annotations
@@ -11,63 +14,133 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from robot_core.delta import (
-    Collector, ExcitationConfig, PhysicsDeltaModel, SafetyLimits, build_excitation,
-)
-from robot_core.integration.full_stack import (
-    FullStack, LATERAL_JOINT, StackConfig, TASK,
-)
+from robot_core.catalog.motion_catalog import MotionCatalog, MotionMeta
+from robot_core.hal.phorce import MockMotion, MockPhorceHAL, N_AXES
 from robot_core.integration.timeline import (
     assert_monotonic, build_timeline, format_timeline,
 )
-from robot_core.recovery import FailureType
+from robot_core.logging.feedback_cache import FeedbackCache
+from robot_core.recovery import (
+    DetectorConfig, FailureDetector, FailureType, LLMConfig, LLMRecoveryAgent,
+    TagRuleFallback, TagSafetyGuard,
+)
+from robot_core.supervisor import Supervisor, SupervisorConfig, SupervisorState
+from robot_core.switching.selector import MissionPlan, MotionSelector
 
-# --- 외란 크기: phact-401 스케일 (감지 임계 tau_detect = 7.2×1.5 = 10.8 Nm) ---
-# 임계가 연속 정격 위(10.8)에 있으므로 감지 가능한 충격은 그만큼 커야 한다 —
-# 실제 충돌은 짧고 크다 (순간 정격 21.6 안). kd 감쇠를 견디고 8ms+ 초과하려면
-# 임계의 ~1.4배 이상 필요.
-IMPACT = 15.0          # 측면 충격 [Nm]
-IMPACT_DURATION = 0.3  # 충격은 짧다. 길게 밀면 그건 충격이 아니라 지속 저항이고,
-                       # 밀린 채 정지한 관절에서 STALL이 (정당하게) 발화해
-                       # 회복 루프까지 개입하는 다른 시나리오가 된다 (S3의 영역)
-IMPACT_JOINT = LATERAL_JOINT   # j0 베이스 요 — 옆에서 밀리는 축
-STALL_FORCE = -1.8     # 지속 저항 [Nm] — 임계(10.8) 미만이라 STALL만이 잡는다
-STALL_JOINT = 1        # j1 숄더 — 실제 목표 각도가 있는 축(고착이 의미를 가짐)
+# ------------------------------------------------------------------ 월드 정의
+HOME = np.zeros(N_AXES)
+POSE_A = np.zeros(N_AXES); POSE_A[:3] = [0.5, -0.3, 0.6]     # 접근 완료 자세
+POSE_B = POSE_A.copy(); POSE_B[3] = 0.4                       # 삽입 완료 자세
+POSE_SIDE = POSE_A.copy(); POSE_SIDE[0] += 0.35               # 옆으로 비켜선 자세
 
-# 저강성 시나리오 게인: 처짐 = |STALL_FORCE|/kp = 1.8/7.5 = 0.24 rad
-# (STALL 임계 0.08의 3배 — 확실히 잡히되 과하지 않게)
-STALL_KP = 7.5
-# scripted LLM이 제안할 강성. 7.5 → 18 은 변화율 제한(2.5배) 안이라 그대로 적용된다.
-RECOVERY_KP, RECOVERY_KP_RETRY = 18.0, 36.0
+TICK_STEPS = 500          # 판단 틱당 시뮬 스텝 (0.5s = 2Hz)
+IMPACT_DOB = 5.0          # [A] 충격 크기 (임계 3.0의 1.7배)
 
-# 캘리브레이션 추종 게인 (phact 스케일, ζ≈0.71)
-CALIB_KP, CALIB_KD = 12.0, 1.1
 
-# 리허설용 축소 여기 설정. 기본값은 저주파(0.3 Hz) 사인이 들어 있는데
-# 생성기의 '최소 1주기' 하한 때문에 관절당 3.3초씩 먹는다 — 6축이면 그것만
-# 40초다. 리허설은 파이프라인 검증이 목적이므로 조합을 줄인다.
-# **현장(scripts/field_calibration.py)은 기본 설정의 전체 커버리지를 쓴다.**
-REHEARSAL_EXCITATION = ExcitationConfig(sweep_freqs=(0.7, 1.4),
-                                        sweep_amp_fracs=(0.5,))
+def _minjerk(p0, p1, T):
+    p0, p1 = np.asarray(p0, float), np.asarray(p1, float)
+
+    def fn(t):
+        s = min(max(t / T, 0.0), 1.0)
+        s = 10 * s**3 - 15 * s**4 + 6 * s**5
+        return p0 + s * (p1 - p0)
+    return fn
+
+
+def _hold(p):
+    p = np.asarray(p, float)
+    return lambda t: p
+
+
+def _meta(mid, name, tags, p0, p1, T, notes=""):
+    d = np.asarray(p1, float) - np.asarray(p0, float)
+    n = float(np.linalg.norm(d))
+    return MotionMeta(mid, name, tags, p0, d / n if n > 1e-6 else d, T, notes)
+
+
+def build_world(*, client=None, selector_cls=MotionSelector,
+                plan_tags=("approach", "insert", "finish"), seed: int = 0,
+                dob_threshold: float = 3.0):
+    """목 로봇 + 카탈로그 + 전체 스택 조립. 시나리오/테스트/비교표 공용."""
+    mock = {
+        1: MockMotion(1.0, _minjerk(HOME, POSE_A, 1.0)),
+        2: MockMotion(1.0, _minjerk(POSE_A, POSE_B, 1.0)),
+        3: MockMotion(0.8, _minjerk(POSE_B, HOME, 0.8)),
+        4: MockMotion(1.5, _hold(POSE_A)),                       # rest (홀드)
+        5: MockMotion(1.2, _minjerk(POSE_A, POSE_SIDE, 1.2)),    # 우회(퇴피)
+        6: MockMotion(1.0, _minjerk(POSE_SIDE, POSE_A, 1.0)),    # 복귀
+        7: MockMotion(2.0, _minjerk(POSE_A, POSE_B, 2.0)),       # 저속 삽입
+        8: MockMotion(1.6, _minjerk(HOME, POSE_A, 1.6)),         # 저속 접근
+    }
+    hal = MockPhorceHAL(mock)
+
+    catalog = MotionCatalog([
+        _meta(1, "approach", ["approach"], HOME, POSE_A, 1.0),
+        _meta(2, "insert", ["insert"], POSE_A, POSE_B, 1.0),
+        _meta(3, "go_home", ["finish"], POSE_B, HOME, 0.8),
+        _meta(4, "rest_hold", ["rest"], POSE_A, POSE_A, 1.5),
+        _meta(5, "side_step", ["retreat"], POSE_A, POSE_SIDE, 1.2),
+        _meta(6, "side_return", ["approach", "retry"], POSE_SIDE, POSE_A, 1.0),
+        _meta(7, "insert_slow", ["insert", "retry", "slow"], POSE_A, POSE_B, 2.0),
+        _meta(8, "approach_slow", ["approach", "slow"], HOME, POSE_A, 1.6),
+    ])
+    usable, warns = catalog.reconcile(hal.catalog())
+
+    cache = FeedbackCache()
+    detector = FailureDetector(N_AXES, DetectorConfig(
+        impact_dob_threshold=dob_threshold,
+        overheat_temp_c=70.0, overheat_release_c=62.0))
+    if selector_cls is MotionSelector:
+        selector = MotionSelector(catalog, usable, entry_max_dist=1.0)
+    else:
+        selector = selector_cls(catalog, usable, seed=seed) \
+            if selector_cls.__name__ == "RandomMotionSelector" \
+            else selector_cls(catalog, usable)
+    guard = TagSafetyGuard(catalog.all_tags(), time_fn=lambda: hal.t)
+    agent = LLMRecoveryAgent(
+        guard, TagRuleFallback(), cache=cache,
+        config=LLMConfig(timeout_s=2.0, cooldown_s=2.0), client=client,
+        time_fn=lambda: hal.t)
+    plan = MissionPlan(list(plan_tags))
+    sup = Supervisor(hal, cache, detector, selector, agent, catalog, plan)
+    for w in warns:
+        cache.mark_event("catalog: " + w)
+    return hal, cache, sup, plan, guard
+
+
+def run_ticks(hal, sup, n_ticks: int, on_tick=None):
+    for k in range(n_ticks):
+        if on_tick:
+            on_tick(k)
+        sup.tick()
+        hal.step(TICK_STEPS)
 
 
 def scripted_llm(system: str, user: str) -> str:
-    """리허설용 결정적 LLM 대역. STALL엔 kp 상향 제안 (재발 시 더 세게)."""
-    kp = RECOVERY_KP_RETRY if "PREVIOUS RECOVERY ATTEMPTS" in user else RECOVERY_KP
-    return json.dumps({
-        "diagnosis": "stall against sustained resistance; raise stiffness",
-        "actions": [{"node": "impedance", "param": "kp", "value": kp}],
-        "confidence": 0.9,
-    })
+    """리허설용 결정적 LLM 대역 — 실패 타입을 프롬프트에서 읽어 태그 선정."""
+    if "PLAYBACK_STALL" in user:
+        out = {"intent_tag": "retry", "urgency": "slow",
+               "reasoning": "blocked mid-motion; retry slowly", "confidence": 0.85}
+    elif "IMPACT" in user:
+        out = {"intent_tag": "retreat", "urgency": "normal",
+               "reasoning": "external impact; step aside", "confidence": 0.9}
+    elif "OVERHEAT" in user:
+        out = {"intent_tag": "rest", "urgency": "stop",
+               "reasoning": "thermal budget exceeded; rest", "confidence": 0.9}
+    else:
+        out = {"intent_tag": "rest", "urgency": "stop",
+               "reasoning": "unknown failure; hold safe", "confidence": 0.5}
+    return json.dumps(out)
 
 
+# ---------------------------------------------------------------- 결과 구조
 @dataclass
 class ScenarioResult:
     name: str
     title: str
-    checks: list[tuple[str, bool, str]] = field(default_factory=list)
+    checks: list = field(default_factory=list)
     timeline: str = ""
-    notes: list[str] = field(default_factory=list)
+    notes: list = field(default_factory=list)
 
     def check(self, desc: str, ok: bool, detail: str = "") -> bool:
         self.checks.append((desc, bool(ok), detail))
@@ -85,245 +158,166 @@ class ScenarioResult:
                          + (f"  ({detail})" if detail else ""))
         for n in self.notes:
             lines.append(f"  - {n}")
-        return "\n".join(lines)
+        return lines and "\n".join(lines)
 
 
-def quick_calibrate(stack: FullStack, per_joint_s: float = 4.0,
-                    notes: list[str] | None = None) -> PhysicsDeltaModel:
-    """축소판 현장 캘리브레이션: 수집(보정기 자동 일시정지) → 물리 피팅 → 적용.
-
-    예산을 '관절당'으로 준다 — 여기 궤적은 순차 모드라 관절 수에 비례해
-    길어지므로, 6축에서 총 예산을 고정하면 관절당 데이터가 반토막 난다.
-
-    여기 궤적의 속도 한계는 **프로파일 값(12.56 rad/s)이 아니라 보수적인
-    기본값(4.0 → 실사용 2.0)을 그대로 쓴다.** 두 가지 이유:
-      1. 마찰 식별에 필요한 것은 저속 구간이지 고속이 아니다. 사인 스윕을
-         속도 한계까지 밀면 가속 토크(I*amp*ω²)가 phact의 작은 연속 토크
-         예산(5.76 Nm)을 그냥 넘긴다 — 실제로 넘겨서 수집이 중단됐다.
-      2. 캘리브레이션은 로봇을 처음 만지는 단계다. 탐침은 얌전할수록 좋다.
-    수집기 안전 감시의 qd_abs만 프로파일 값으로 둔다 (하드웨어 상한 가드).
-    """
-    n = stack.cfg.n_joints
-    plan = build_excitation(
-        list(range(n)), stack.hal.joint_limits, budget_s=per_joint_s * n,
-        n_joints=n, config=REHEARSAL_EXCITATION)
-    log_lines: list[str] = []
-    # 중단 기준은 연속 예산 절대값 — HAL 한계(순간 21.6)의 비율로 잡으면
-    # 저속 탐침에서 뭔가 크게 잘못돼도 18Nm까지 안 끊는다
-    collector = Collector(stack.hal, kp=CALIB_KP, kd=CALIB_KD,
-                          safety=SafetyLimits(tau_abs=stack.cfg.torque_limit,
-                                              qd_abs=stack.cfg.qd_limit),
-                          pause_correction=[stack.corrector],
-                          on_log=log_lines.append)
-    data = collector.collect(plan)
-    model = PhysicsDeltaModel(stack.cfg.n_joints).fit(data)
-    # Δτ 클램프는 지속 예산(tau_cont) 기준 — HAL 한계(버스트)가 아니다
-    stack.corrector.set_model(
-        model, torque_limits=np.full(stack.cfg.n_joints, stack.cfg.torque_limit),
-        current_afc_state=str(getattr(stack.hal, "afc_state", "unknown")))
-    stack.hal.reset()          # 캘리브레이션 흔적을 지우고 로봇 클록 0에서 시작
-    stack.logger.clear()
-    stack.logger.mark_event(f"calibration done ({data.n_samples} samples, "
-                            f"physics model applied)", t=0.0)
-    if notes is not None:
-        notes.extend(log_lines)
-    return model
-
-
-def _finish(result: ScenarioResult, stack: FullStack, title: str = None) -> ScenarioResult:
-    entries = build_timeline(logger=stack.logger, switch_node=stack.chunk_node,
-                             guard=stack.guard)
+def _finish(r: ScenarioResult, cache, guard) -> ScenarioResult:
+    entries = build_timeline(logger=cache, guard=guard)
     assert_monotonic(entries)
-    result.timeline = format_timeline(entries, title=f"{result.name} TIMELINE")
-    return result
+    r.timeline = format_timeline(entries, title=f"{r.name} TIMELINE")
+    return r
+
+
+def _texts(cache) -> list[str]:
+    return [e.text for e in cache.events()]
 
 
 # ---------------------------------------------------------------- S1: 평화
 def s1_peace() -> ScenarioResult:
-    r = ScenarioResult("S1", "평화 — 전 모듈 on, 개입 0 (오발동 검사)")
-    stack = FullStack.build(StackConfig())
-    quick_calibrate(stack, notes=r.notes)
-    stack.corrector.params["fade_s"] = 0.2
-    stack.corrector.enable_correction()
-    stack.chunk_node.set_active(stack.dictionary.get("direct"), t_now=stack.hal.t)
+    r = ScenarioResult("S1", "평화 — 모션 3개 순차 재생, 오발동 0")
+    hal, cache, sup, plan, guard = build_world()
+    run_ticks(hal, sup, 14)
 
-    stack.step(2000)   # 2.0s: 이동 + 정착
-
-    q = stack.hal.read_state().q
-    r.check("추종 성공 (오차 < 0.05)", np.abs(q - stack.cfg.goal).max() < 0.05,
-            f"q={np.round(q, 3)}")
-    r.check("감지 이벤트 0", not any(e.text.startswith("DETECTED")
-                                for e in stack.logger.events()))
-    r.check("스위칭 결정 0", len(stack.chunk_node.decisions) == 0)
-    r.check("회복 개입 0 (guard 비어있음)", len(stack.guard.audit) == 0)
-    r.check("LLM 질의 0", stack.agent.stats.get("submitted", 0) == 0)
-    if stack.delta_history:
-        peak = float(np.abs(np.array(stack.delta_history)).max())
-        cap = 0.3 * stack.cfg.torque_limit
-        r.check("보정 토크가 클램프 안", peak <= cap + 1e-9, f"peak={peak:.2f}")
-    return _finish(r, stack)
+    texts = _texts(cache)
+    r.check("계획 완주 (approach→insert→finish)", plan.done and
+            sup.state == SupervisorState.DONE, f"cursor={plan.cursor}")
+    r.check("감지 이벤트 0", not any(t.startswith("DETECTED") for t in texts))
+    r.check("LLM 질의 0", sup.agent.stats.get("submitted", 0) == 0)
+    r.check("BUSY 폭주 0 (재생 중 play 시도 없음)", sup.busy_rejections == 0)
+    q = hal.latest_feedback().position_rad
+    r.check("최종 자세 = HOME", float(np.abs(q - HOME).max()) < 0.05,
+            f"|err|max={np.abs(q - HOME).max():.3f}")
+    return _finish(r, cache, guard)
 
 
-# ---------------------------------------------------------- S2: 충격→우회
-def s2_impact_switch() -> ScenarioResult:
-    r = ScenarioResult("S2", "충격→우회 — 스위칭만 발동, 회복 루프 침묵 (인터록)")
-    stack = FullStack.build(StackConfig())
-    stack.chunk_node.set_active(stack.dictionary.get("direct"), t_now=0.0)
+# ------------------------------------------------------- S2: 충격 → 우회
+def s2_impact_retreat() -> ScenarioResult:
+    r = ScenarioResult("S2", "충격→우회 — dob_a 이력 보고 retreat 태그 선곡")
+    hal, cache, sup, plan, guard = build_world()
 
-    stack.step(400)
-    stack.hal.inject_disturbance(IMPACT_JOINT, +IMPACT, duration=IMPACT_DURATION)
-    stack.logger.mark_event(
-        f"INJECT impact {IMPACT:+.1f} Nm on joint {IMPACT_JOINT}", t=stack.hal.t)
-    stack.step(2400)
+    def on_tick(k):
+        if k == 3:   # motion 1 재생 중간(t≈1.5s 구간)에 측면 충격
+            hal.inject_disturbance(0, IMPACT_DOB, duration=0.25)
+            cache.mark_event(f"INJECT impact dob={IMPACT_DOB:+.1f} A on axis 0",
+                             t=hal.t)
+    run_ticks(hal, sup, 20, on_tick)
 
-    switches = [d for d in stack.chunk_node.decisions if d.chosen is not None]
-    r.check("스위칭 정확히 1회", len(switches) == 1,
-            f"{[d.chosen for d in switches]}")
-    if switches:
-        # 외란이 j0를 + 로 미니 순응하는 쪽(+j0 스윙)을 골라야 한다
-        r.check("순응 우회(detour_left) 선택", switches[0].chosen == "detour_left",
-                switches[0].chosen)
-    r.check("회복 루프 침묵 (guard 비어있음)", len(stack.guard.audit) == 0)
-    r.check("LLM 질의 0", stack.agent.stats.get("submitted", 0) == 0)
-    r.check("인터록 'handled by switching' 기록",
-            any("handled by switching" in e.text for e in stack.logger.events()))
-    q = stack.hal.read_state().q
-    r.check("목표 도달", np.abs(q - stack.cfg.goal).max() < 0.06,
-            f"q={np.round(q, 3)}")
-    return _finish(r, stack)
+    texts = _texts(cache)
+    r.check("IMPACT 감지", any("DETECTED IMPACT" in t for t in texts))
+    r.check("규칙 폴백 → retreat 태그", any(
+        "intent='retreat'" in t for t in texts))
+    r.check("우회 모션(side_step) 재생", any(
+        "play: motion 5" in t for t in texts))
+    r.check("이후 계획 복귀·완주", plan.done, f"cursor={plan.cursor}")
+    r.check("BUSY 폭주 0", sup.busy_rejections == 0)
+    return _finish(r, cache, guard)
 
 
-# ---------------------------------------------------------- S3: 고착→회복
-def s3_stall_recovery() -> ScenarioResult:
-    r = ScenarioResult("S3", "고착→회복 — STALL은 인터록 예외로 회복 루프 개입")
-    stack = FullStack.build(StackConfig(kp=STALL_KP), scripted_llm=scripted_llm)
-    stack.chunk_node.set_active(stack.dictionary.get("direct"), t_now=0.0)
-    goal_j = stack.cfg.goal[STALL_JOINT]
+# ------------------------------------------------------ S3: 막힘 → 재시도
+def s3_stall_retry() -> ScenarioResult:
+    r = ScenarioResult("S3", "막힘→재시도 — PLAYBACK_STALL → LLM 경로 → slow 재선곡")
+    hal, cache, sup, plan, guard = build_world(client=scripted_llm)
 
-    stack.step(1600)   # 목표 도달 후 홀드
-    stack.hal.inject_disturbance(STALL_JOINT, STALL_FORCE, duration=30.0)
-    stack.logger.mark_event(
-        f"INJECT sustained {STALL_FORCE:+.1f} Nm on joint {STALL_JOINT}",
-        t=stack.hal.t)
-    stack.step(600)
-    err_before = abs(stack.hal.read_state().q[STALL_JOINT] - goal_j)
-    stack.step(1400)
-    err_after = abs(stack.hal.read_state().q[STALL_JOINT] - goal_j)
+    # 삽입(motion 2)이 움직이는 축(3)을 물체가 물리적으로 막는다.
+    # 지속 '힘'으로는 스톨이 안 난다 — PD는 오프셋 진 채 계속 추종한다.
+    # 진행 자체가 불가능한 상황 = jam이 맞는 물리다.
+    def on_tick(k):
+        if k == 4:                     # t=2.0, insert(1.5..2.5s) 한복판
+            hal.inject_jam(3)
+            cache.mark_event("INJECT jam on axis 3 (object blocks insertion)",
+                             t=hal.t)
+        if k == 8:                     # t=4.0, 물체가 치워짐
+            hal.clear_jam(3)
+            cache.mark_event("jam cleared (obstacle removed)", t=hal.t)
+    run_ticks(hal, sup, 26, on_tick)
 
-    events = [e.text for e in stack.logger.events()]
-    r.check("STALL 감지",
-            any(f"DETECTED STALL joint={STALL_JOINT}" in t for t in events))
-    r.check("인터록 예외 경로 기록", any("STALL은 인터록 예외" in t for t in events))
-    applied = [a for a in stack.guard.audit if a.applied is not None]
-    r.check("회복 루프가 파라미터 적용", len(applied) >= 1,
-            f"{len(applied)} applies")
-    r.check("LLM 경로 사용", any(a.source == "llm" for a in stack.guard.audit))
-    r.check("스위칭 미발동", not any(d.chosen for d in stack.chunk_node.decisions))
-    r.check("오차 절반 이하로 회복", err_after < err_before / 2,
-            f"{err_before:.3f} -> {err_after:.3f} rad")
-    return _finish(r, stack)
+    texts = _texts(cache)
+    r.check("PLAYBACK_STALL 감지", any("DETECTED PLAYBACK_STALL" in t for t in texts))
+    r.check("LLM 경로 사용 (source=llm)", any(
+        "recovery[llm]" in t and "retry" in t for t in texts))
+    r.check("slow 변주(insert_slow=7) 재선곡", any(
+        "play: motion 7" in t for t in texts))
+    r.check("막힘 해제 후 계획 완주", plan.done, f"cursor={plan.cursor}")
+    r.check("BUSY 폭주 0", sup.busy_rejections == 0)
+    return _finish(r, cache, guard)
 
 
-# ---------------------------------------------------------- S4: 마찰 지옥
-def s4_friction_hell() -> ScenarioResult:
-    r = ScenarioResult("S4", "마찰 지옥(3배) — 보정 기여도 정량화")
-    base = StackConfig()
-    hell_tc, hell_b = base.coulomb * 3, base.viscous * 3   # 기본의 3배
-    stack = FullStack.build(StackConfig(coulomb=hell_tc, viscous=hell_b))
-    model = quick_calibrate(stack, per_joint_s=6.0, notes=r.notes)
+# ----------------------------------------------------------- S4: 과열
+def s4_overheat_rest() -> ScenarioResult:
+    r = ScenarioResult("S4", "과열 — OVERHEAT → 휴지 삽입 → 해제 후 복귀")
+    hal, cache, sup, plan, guard = build_world()
 
-    tc = model.params[0].coulomb
-    r.check("3배 마찰 복원 (tau_c 오차 < 15%)", abs(tc - hell_tc) / hell_tc < 0.15,
-            f"tau_c={tc:.3f} vs {hell_tc:.2f}")
+    def on_tick(k):
+        if k == 3:                       # 재생 중 과열 주입
+            for ax in (1, 2):
+                hal.set_temperature(ax, 75.0)
+            cache.mark_event("INJECT overheat 75C on axes 1,2", t=hal.t)
+        if k == 9:                       # 냉각 (해제 임계 62C 아래로)
+            for ax in (1, 2):
+                hal.set_temperature(ax, 55.0)
+            cache.mark_event("cooldown to 55C", t=hal.t)
+    run_ticks(hal, sup, 26, on_tick)
 
-    def track(correct: bool) -> float:
-        stack.hal.reset()
-        stack.corrector.disable_correction()
-        if correct:
-            stack.corrector.params["fade_s"] = 0.0
-            stack.corrector.enable_correction()
-        if hasattr(model, "reset"):
-            model.reset()
-        stack.chunk_node.set_active(stack.dictionary.get("direct"), t_now=0.0)
-        errs = []
-        for k in range(1800):
-            state = stack.hal.read_state()
-            cmd = stack.policy(state)
-            stack.hal.send_command(cmd)
-            errs.append(np.abs(stack.hal.read_state().q - cmd.q_des))
-        return float(np.sqrt(np.mean(np.square(errs))))
-
-    rms_off = track(False)
-    rms_on = track(True)
-    imp = (1 - rms_on / rms_off) * 100
-    r.check("보정 on이 추종 오차 30%+ 개선", imp > 30.0,
-            f"off {rms_off:.5f} -> on {rms_on:.5f} rad ({imp:+.1f}%)")
-    r.notes.append(f"보정 기여도: RMS {rms_off:.5f} → {rms_on:.5f} rad ({imp:+.1f}%)")
-    r.notes.append(stack.corrector.timing_report())
-    r.check("추론 예산 준수", "OK" in stack.corrector.timing_report())
-    return _finish(r, stack)
+    texts = _texts(cache)
+    r.check("OVERHEAT 감지", any("DETECTED OVERHEAT joint" in t
+                              or "DETECTED OVERHEAT " in t for t in texts))
+    r.check("휴지(rest_hold=4) 삽입", any("play: motion 4" in t for t in texts))
+    r.check("해제(OVERHEAT_CLEARED) 수신", any(
+        "OVERHEAT_CLEARED" in t for t in texts))
+    r.check("휴지 해제 후 계획 복귀·완주", plan.done, f"cursor={plan.cursor}")
+    r.check("BUSY 폭주 0", sup.busy_rejections == 0)
+    return _finish(r, cache, guard)
 
 
-# ------------------------------------------------------------ S5: 총력전
+# ----------------------------------------------------------- S5: 총력전
 def s5_full_battle() -> ScenarioResult:
-    r = ScenarioResult("S5", "총력전 — 캘리브레이션→충격→고착 연쇄, 단일 타임라인")
-    stack = FullStack.build(StackConfig(kp=STALL_KP), scripted_llm=scripted_llm)
+    r = ScenarioResult("S5", "총력전 — 충격→우회 + 거절 12→WAITING_OPERATOR + 완주")
+    hal, cache, sup, plan, guard = build_world(client=scripted_llm)
 
-    # --- 0: 캘리브레이션 (보정기가 켜져 있어도 자동 일시정지되는지 = (B)) ---
-    stack.corrector.params["fade_s"] = 0.3
-    stack.corrector.enable_correction()          # 모델 없이도 '켜짐' 상태
-    quick_calibrate(stack, notes=r.notes)
-    r.check("(B) 수집 중 보정기 자동 일시정지 로그",
-            any("paused for collection" in n for n in r.notes))
-    r.check("(B) 수집 후 보정기 복원", stack.corrector.correction_enabled)
+    def on_tick(k):
+        if k == 3:
+            hal.inject_disturbance(0, IMPACT_DOB, duration=0.25)
+            cache.mark_event(f"INJECT impact dob={IMPACT_DOB:+.1f} A on axis 0",
+                             t=hal.t)
+        if k == 7:                       # 다음 선곡 직전에 NOT_READY 거절 무장
+            hal.set_rejection(12)
+            cache.mark_event("INJECT rejection code 12 (NOT_READY)", t=hal.t)
+    run_ticks(hal, sup, 12, on_tick)
 
-    stack.chunk_node.set_active(stack.dictionary.get("direct"), t_now=stack.hal.t)
+    waited = sup.state == SupervisorState.WAITING_OPERATOR
+    r.check("1단계: IMPACT → retreat 우회", any(
+        "play: motion 5" in t for t in _texts(cache)))
+    r.check("2단계: 거절 12 → WAITING_OPERATOR", waited, f"state={sup.state}")
 
-    # --- 1: 이동 중 측면 충격 → 스위칭 ---
-    stack.step(400)
-    stack.hal.inject_disturbance(IMPACT_JOINT, +IMPACT, duration=IMPACT_DURATION)
-    stack.logger.mark_event(
-        f"INJECT impact {IMPACT:+.1f} Nm on joint {IMPACT_JOINT}", t=stack.hal.t)
-    stack.step(2400)
-    switches = [d for d in stack.chunk_node.decisions if d.chosen is not None]
-    r.check("1단계: 충격 → 스위칭 발동", len(switches) == 1,
-            f"{[d.chosen for d in switches]}")
+    plays_before = sum(1 for t in _texts(cache) if t.startswith("play: motion"))
+    run_ticks(hal, sup, 4)              # 대기 중 — 자동 재시도 없어야 함
+    plays_after = sum(1 for t in _texts(cache) if t.startswith("play: motion"))
+    r.check("대기 중 자동 재시도 0", plays_after == plays_before)
 
-    # --- 2: 도달 후 지속 저항 → STALL → 회복 ---
-    stack.hal.inject_disturbance(STALL_JOINT, STALL_FORCE, duration=30.0)
-    stack.logger.mark_event(
-        f"INJECT sustained {STALL_FORCE:+.1f} Nm on joint {STALL_JOINT}",
-        t=stack.hal.t)
-    stack.step(2000)
-    applied = [a for a in stack.guard.audit if a.applied is not None]
-    r.check("2단계: STALL → 회복 루프 적용", len(applied) >= 1,
-            f"{len(applied)} applies")
+    hal.clear_rejection()               # 사람이 영점 버튼을 눌렀다
+    sup.operator_cleared()
+    cache.mark_event("operator: zero-button done (human)", t=hal.t)
+    run_ticks(hal, sup, 18)
 
-    # --- 판정: 타임라인 일관성 ((D)) ---
-    entries = build_timeline(logger=stack.logger, switch_node=stack.chunk_node,
-                             guard=stack.guard)
-    assert_monotonic(entries)
-    sources = {e.source for e in entries}
-    r.check("(D) 전 소스가 한 타임라인에", {"detect", "interlock", "switch",
-                                       "guard", "event"} <= sources,
+    r.check("개입 후 계획 완주", plan.done and sup.state == SupervisorState.DONE,
+            f"cursor={plan.cursor} state={sup.state}")
+    r.check("BUSY 폭주 0", sup.busy_rejections == 0)
+
+    _finish(r, cache, guard)
+    texts = r.timeline
+    sources = {line.split("]")[1].split("|")[0].strip()
+               for line in texts.splitlines() if line.startswith("[t=")}
+    r.check("(단일 타임라인) 소스 다양성", {"detect", "recovery", "select",
+                                     "play", "operator"} <= sources,
             f"sources={sorted(sources)}")
-    if switches and applied:
-        r.check("(D) 순서: 스위칭 → 회복", switches[0].t < applied[0].wall_t,
-                f"switch t={switches[0].t:.3f} < guard t={applied[0].wall_t:.3f}")
-    # 회복 후 남는 처짐 = |STALL_FORCE| / 상향된 kp = 1.8/18 = 0.10 rad
-    err_j = abs(stack.hal.read_state().q[STALL_JOINT] - stack.cfg.goal[STALL_JOINT])
-    r.check(f"최종 오차 회복 (joint{STALL_JOINT} < 0.11)", err_j < 0.11,
-            f"err={err_j:.3f}")
-
-    r.timeline = format_timeline(entries, title="S5 TIMELINE")
     return r
 
 
 SCENARIOS = {
     "S1": s1_peace,
-    "S2": s2_impact_switch,
-    "S3": s3_stall_recovery,
-    "S4": s4_friction_hell,
+    "S2": s2_impact_retreat,
+    "S3": s3_stall_retry,
+    "S4": s4_overheat_rest,
     "S5": s5_full_battle,
 }
 
@@ -354,7 +348,8 @@ if __name__ == "__main__":
     if args.scenario:
         res = SCENARIOS[args.scenario]()
         print(res.summary())
-        print(res.timeline)
+        if not args.no_timeline:
+            print(res.timeline)
         raise SystemExit(0 if res.ok else 1)
     results = run_all(show_timeline=not args.no_timeline)
     raise SystemExit(0 if all(r.ok for r in results) else 1)

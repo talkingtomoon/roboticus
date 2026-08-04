@@ -7,14 +7,18 @@ from enum import Enum
 
 
 class FailureType(str, Enum):
-    TORQUE_SPIKE = "TORQUE_SPIKE"  # 움직이다 걸림 — 토크가 임계치 초과
-    STALL = "STALL"                # 지령은 가는데 관절이 안 감 — 정지 중 고착 포함
-    OSCILLATION = "OSCILLATION"    # 토크/속도 부호가 고주파로 반전 — 게인 과다
-    # 지속 과부하: 지령 토크의 1초 이동평균이 연속 예산(tau_cont) 초과.
-    # 순간 스파이크가 아니라 열 예산 문제 — 규칙 폴백은 동작 속도 하향.
+    # ---- phorce 인터페이스 기준 (현행) ----
+    PLAYBACK_STALL = "PLAYBACK_STALL"  # 재생 중인데 진행 없음 — 물체에 막힘
+    IMPACT = "IMPACT"                  # dob_a 스파이크 — 외부 충격/접촉
+    OVERHEAT = "OVERHEAT"              # temp_c 임계 초과 — 지속 과부하의 phorce 판
+    OVERHEAT_CLEARED = "OVERHEAT_CLEARED"  # 과열 해제 통지 (실패 아님 — 복귀 트리거)
+    AXIS_FAULT = "AXIS_FAULT"          # fault 비트 발화 — 축 이상
+
+    # ---- legacy (임피던스 인터페이스 시절 — robot_core/legacy 참고용 코드가 참조) ----
+    TORQUE_SPIKE = "TORQUE_SPIKE"
+    STALL = "STALL"
+    OSCILLATION = "OSCILLATION"
     CONTINUOUS_OVERLOAD = "CONTINUOUS_OVERLOAD"
-    # 위 과부하의 해제 통지 (실패가 아니라 상태 전이 — 회복 루프가 낮췄던
-    # 속도를 복원하는 트리거. LLM/쿨다운을 태우지 않고 규칙에 직행시킨다).
     OVERLOAD_CLEARED = "OVERLOAD_CLEARED"
 
 

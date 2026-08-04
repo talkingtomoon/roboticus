@@ -1,16 +1,13 @@
 """규칙 기반 회복 폴백.
 
 LLM이 없어도(API 죽어도, 타임아웃 나도, 헛소리해도) 시스템이 회복을 시도하게
-하는 최소 전략. 값은 어차피 SafetyGuard를 다시 통과하므로 여기서는 방향만 잡는다.
+하는 최소 전략.
 
-기본 전략:
-- TORQUE_SPIKE        → 후퇴(target retreat 증가) + kp 절반
-- STALL               → kp 증가(지령 진폭/강성 키워 밀어붙임) + 후퇴 살짝 풀기
-- OSCILLATION         → kd 증가 + kp 감소
-- CONTINUOUS_OVERLOAD → 동작 속도 하향 (chunk_switch.time_scale × 0.6 —
-                        열 예산 초과는 게인이 아니라 duty의 문제)
-- OVERLOAD_CLEARED    → 속도 복원 (time_scale = 1.0. 내려가는 길만 있고
-                        올라오는 길이 없으면 한 번 느려진 로봇이 영원히 긴다)
+phorce 판 (현행): **TagRuleFallback** — 실패 타입 → (의도 태그, 긴급도) 매핑.
+LLM과 동일하게 태그만 내고, motion_id는 선택기가 고른다.
+
+파일 하단의 RuleBasedRecovery(파라미터 조정)는 임피던스 시절 —
+robot_core/legacy 참고용 코드가 쓴다.
 """
 
 from __future__ import annotations
@@ -19,6 +16,46 @@ from dataclasses import dataclass
 
 from robot_core.graph.manager import NodeGraphManager
 from robot_core.recovery.events import FailureEvent, FailureType
+
+
+# ==========================================================================
+# phorce 판 (현행): 실패 타입 → (의도 태그, 긴급도)
+# ==========================================================================
+# 긴급도 의미 (supervisor가 해석):
+#   normal = 계획 계속, slow = 저속 변주 선호(선택기 modifier), stop = 휴지 후 관망
+DEFAULT_TAG_MAP: dict[FailureType, tuple[str, str]] = {
+    FailureType.IMPACT: ("retreat", "normal"),          # 충격 → 일단 물러난다
+    FailureType.PLAYBACK_STALL: ("retry", "slow"),      # 막힘 → 천천히 재시도
+    FailureType.OVERHEAT: ("rest", "stop"),             # 과열 → 휴지 삽입
+    FailureType.AXIS_FAULT: ("rest", "stop"),           # 축 이상 → 안전 휴지
+}
+
+
+@dataclass
+class TagDecision:
+    """회복 결정: 의도 태그 + 긴급도. motion_id가 아니다 — 선곡은 선택기가."""
+
+    intent_tag: str
+    urgency: str          # "normal" | "slow" | "stop"
+    source: str           # "llm" | "rules:<이유>"
+    reasoning: str = ""
+    confidence: float = 1.0
+
+
+class TagRuleFallback:
+    """실패 타입 → 태그 매핑 테이블. LLM의 결정적 대역.
+
+    매핑에 없는 실패 타입은 default로 — 모르는 상황에서 제일 안전한 선택은
+    '쉬면서 관망'이다.
+    """
+
+    def __init__(self, mapping: dict[FailureType, tuple[str, str]] | None = None,
+                 default: tuple[str, str] = ("rest", "stop")) -> None:
+        self.mapping = dict(DEFAULT_TAG_MAP if mapping is None else mapping)
+        self.default = tuple(default)
+
+    def propose(self, event: FailureEvent) -> tuple[str, str]:
+        return self.mapping.get(event.type, self.default)
 
 
 @dataclass

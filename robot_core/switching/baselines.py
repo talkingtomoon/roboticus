@@ -1,56 +1,61 @@
-"""스위칭 베이스라인 — DREAM-Chunk 원문 레포의 비교 기준 차용.
+"""선택기 베이스라인 — 무작위 선곡 / 항상 첫 후보 (비교표용).
 
-채점기와 같은 인터페이스(score/chunks)를 내놓지만:
-- RandomChunkSelector : 무작위 후보 선택 (시드 고정 가능)
-- FirstChunkSelector  : 항상 첫 후보 선택
-
-발표용 비교표(scripts/baseline_switch_comparison.py)에서 "채점기가 정말
-나은가"를 수치로 보여주는 용도다. Dream veto도 없다 — 베이스라인이니까.
+MotionSelector와 같은 select() 인터페이스. 하드 필터 중 '적재 여부'만
+공유한다 (미적재 재생은 즉시 코드 4 거절이라 비교 자체가 안 된다).
+진입 거리 필터는 일부러 없다 — 엉뚱한 자세에서 재생하는 것이
+베이스라인의 본질적 약점이고, 그게 비교표에 드러나야 한다.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-from robot_core.chunks.format import MotionChunk
-from robot_core.switching.scorer import CandidateScore, ScoreReport
+from robot_core.catalog.motion_catalog import MotionCatalog
+from robot_core.switching.selector import (
+    CandidateRow, MissionPlan, SelectionReport,
+)
 
 
-class _SelectorBase:
-    """ChunkSwitchNode가 기대하는 최소 인터페이스: .chunks, .score(...)."""
+class _BaselineSelector:
+    def __init__(self, catalog: MotionCatalog, loaded_ids) -> None:
+        self.catalog = catalog
+        self.loaded = {int(i) for i in loaded_ids}
 
-    def __init__(self, chunks: list[MotionChunk]) -> None:
-        if not chunks:
-            raise ValueError("need at least one candidate chunk")
-        self.chunks = list(chunks)
-
-    def _pick(self) -> int:
+    def _pick(self, ids: list[int]) -> int:
         raise NotImplementedError
 
-    def score(self, q, qd, disturbance, goal) -> ScoreReport:
-        best = self._pick()
-        entries = [
-            CandidateScore(name=c.name, connection=0.0, resistance=0.0,
-                           progress=0.0, total=0.0 if i == best else 1.0,
-                           vetoed=False, peak_tau_frac=0.0)
-            for i, c in enumerate(self.chunks)
-        ]
-        return ScoreReport(entries=entries, best_index=best, elapsed_ms=0.0)
+    def select(self, position, valid, dob, intent_tag: str, plan: MissionPlan,
+               modifiers: tuple = ()) -> SelectionReport:
+        rows = []
+        playable = []
+        for m in self.catalog.all():
+            if m.id not in self.loaded:
+                rows.append(CandidateRow(m.id, m.name, 0, 0, 0, 0, 0,
+                                         excluded="not loaded"))
+            else:
+                playable.append(m.id)
+                rows.append(CandidateRow(m.id, m.name, 0, 0, 0, 0, 0))
+        best = self._pick(playable) if playable else None
+        for r in rows:
+            if r.motion_id == best:
+                r.total = 0.0
+            elif not r.excluded:
+                r.total = 1.0
+        return SelectionReport(rows=rows, best_id=best, intent_tag=intent_tag,
+                               modifiers=tuple(modifiers))
 
 
-class RandomChunkSelector(_SelectorBase):
-    """무작위 선택. seed 고정 시 결정적."""
-
-    def __init__(self, chunks: list[MotionChunk], seed: int = 0) -> None:
-        super().__init__(chunks)
+class RandomMotionSelector(_BaselineSelector):
+    def __init__(self, catalog, loaded_ids, seed: int = 0) -> None:
+        super().__init__(catalog, loaded_ids)
         self._rng = np.random.default_rng(seed)
 
-    def _pick(self) -> int:
-        return int(self._rng.integers(0, len(self.chunks)))
+    def _pick(self, ids: list[int]) -> int:
+        return int(self._rng.choice(ids))
 
 
-class FirstChunkSelector(_SelectorBase):
-    """항상 첫 후보 (딕셔너리 정렬 순)."""
+class FirstMotionSelector(_BaselineSelector):
+    """항상 (정렬상) 첫 후보 — 성능이 슬롯 번호라는 우연에 지배됨을 보여준다."""
 
-    def _pick(self) -> int:
-        return 0
+    def _pick(self, ids: list[int]) -> int:
+        return int(ids[0])

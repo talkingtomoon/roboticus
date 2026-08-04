@@ -1,9 +1,13 @@
-"""HAL 계약 테스트: 목이든 실물이든 이 규약은 깨지면 안 된다."""
+"""내부 동역학 엔진(MockRobotHAL) 계약 테스트.
+
+주의: 이 타입들은 phorce 피벗 이후 '목의 물리 엔진' 내부용이다.
+상위 시스템의 경계는 hal/phorce.py의 PhorceHAL이다 (test_phorce_hal.py).
+"""
 
 import numpy as np
 import pytest
 
-from robot_core import JointCommand, JointState, MockRobotHAL, RealRobotHAL, RobotHAL
+from robot_core.hal import JointCommand, JointState, MockRobotHAL, RobotHAL
 
 
 def test_mock_is_a_robot_hal(hal):
@@ -71,31 +75,5 @@ def test_impedance_law_matches_spec():
     assert hal.read_state().tau_measured[0] == pytest.approx(expected)
 
 
-# ----------------------------------------------------------------- 실물 stub
-def test_real_hal_is_a_robot_hal_subclass():
-    assert issubclass(RealRobotHAL, RobotHAL)
-
-
-def test_real_hal_methods_raise_not_implemented():
-    real = RealRobotHAL(channel="can0", motor_ids=[1, 2, 3])
-    assert real.n_joints == 3  # 이건 __init__에서 정해지므로 동작한다
-    with pytest.raises(NotImplementedError):
-        real.read_state()
-    with pytest.raises(NotImplementedError):
-        real.send_command(JointCommand.hold(np.zeros(3)))
-    with pytest.raises(NotImplementedError):
-        _ = real.joint_limits
-    with pytest.raises(NotImplementedError):
-        _ = real.torque_limits
-    for method in ("connect", "enable", "disable", "estop", "close"):
-        with pytest.raises(NotImplementedError):
-            getattr(real, method)()
-
-
-def test_real_hal_pack_unpack_roundtrip():
-    """현장에서 쓸 고정소수점 헬퍼는 지금 검증해 둔다."""
-    lo, hi, bits = -12.5, 12.5, 16
-    for value in (-12.5, -3.0, 0.0, 4.2, 12.5):
-        raw = RealRobotHAL._pack_float(value, lo, hi, bits)
-        assert 0 <= raw < (1 << bits)
-        assert RealRobotHAL._unpack_float(raw, lo, hi, bits) == pytest.approx(value, abs=1e-3)
+# (구 임피던스 RealRobotHAL stub 테스트는 legacy 이동과 함께 제거 —
+#  실물 경계는 이제 PhorceHAL이고 test_phorce_hal.py가 담당한다)

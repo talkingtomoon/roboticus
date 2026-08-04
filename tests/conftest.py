@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from robot_core import JointCommand, MockRobotHAL
+from robot_core.hal import JointCommand, MockRobotHAL
 
 
 @pytest.fixture

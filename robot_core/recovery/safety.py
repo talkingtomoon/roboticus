@@ -1,18 +1,20 @@
-"""SafetyGuard — 파라미터 변경의 유일한 관문.
+"""SafetyGuard — 위험한 결정의 유일한 관문.
 
-LLM이든 규칙 폴백이든 ROS 2 파라미터 서버든, 파라미터 변경은 전부 여기를
-통과해야 한다. 원칙:
+phorce 피벗 이후의 현행 가드는 **TagSafetyGuard** (파일 하단):
+LLM은 의도 태그만 내고, 태그는 카탈로그에 존재하는 것만 통과한다.
+motion_id 최종 결정은 선택기가 한다 (실행 경로 분리 원칙).
 
-- 화이트리스트에 없는 (node, param) → 거부
-- 범위 밖 값 → [min, max]로 클램프하고 경고 (거부가 아니라 클램프 —
-  부분적으로라도 회복하게)
-- 변화율 제한: 한 번의 적용에서 현재값 대비 ×max_rel_step / ÷max_rel_step,
-  ±max_abs_step 이상 못 바꾼다 (kp 10배 튀기기 방지)
-- 값이 숫자가 아니거나 NaN/inf → 거부
-- 모든 시도(적용/클램프/거부)를 감사 로그에 남긴다
+아래 SafetyGuard/ParamSpec은 임피던스 시절의 파라미터 가드 —
+robot_core/legacy 참고용 코드가 쓴다.
 """
 
 from __future__ import annotations
+
+# [legacy] SafetyGuard(파라미터 관문) 원칙 — 참고용 코드가 쓰는 구 가드:
+# - 화이트리스트에 없는 (node, param) → 거부
+# - 범위 밖 값 → [min, max] 클램프 + 경고 (부분적으로라도 회복하게)
+# - 변화율 제한 (×max_rel_step / ±max_abs_step — kp 10배 튀기기 방지)
+# - 숫자 아니거나 NaN/inf → 거부, 모든 시도를 감사 로그에
 
 import math
 import threading
@@ -188,3 +190,59 @@ class SafetyGuard:
                 + (", " + ", ".join(limits) if limits else "") + ")"
             )
         return "\n".join(lines)
+
+
+# ==========================================================================
+# TagSafetyGuard - phorce 피벗 이후의 현행 가드
+# ==========================================================================
+@dataclass
+class TagAuditEntry:
+    wall_t: float
+    source: str            # "llm" / "rules:<이유>" / "plan"
+    requested: str         # 요청된 의도 태그
+    accepted: str | None   # 통과한 태그. 거부면 None
+    status: str            # "accepted" | "rejected"
+    reason: str = ""
+
+    def line(self) -> str:
+        acc = self.accepted if self.accepted is not None else "-"
+        return (f"[{self.wall_t:9.3f}] {self.status.upper():9s} "
+                f"tag={self.requested!r} -> {acc!r} src={self.source}"
+                + (f" ({self.reason})" if self.reason else ""))
+
+
+class TagSafetyGuard:
+    """의도 태그의 유일한 관문 - 화이트리스트 = 카탈로그에 존재하는 태그 집합.
+
+    LLM이 미지의 태그를 지어내면 여기서 거부되고 폴백 태그로 간다.
+    motion_id를 직접 고르는 경로는 아예 없다 (선택기만 고른다).
+    """
+
+    def __init__(self, allowed_tags, time_fn=time.monotonic) -> None:
+        self.allowed = {str(t) for t in allowed_tags}
+        self._time = time_fn
+        self._audit: list[TagAuditEntry] = []
+        self._lock = threading.Lock()
+
+    @property
+    def audit(self) -> list[TagAuditEntry]:
+        with self._lock:
+            return list(self._audit)
+
+    def validate(self, tag, source: str) -> str | None:
+        """통과한 태그 또는 None. 모든 시도를 감사 로그에 남긴다."""
+        now = self._time()
+        if not isinstance(tag, str) or not tag:
+            entry = TagAuditEntry(now, source, repr(tag), None, "rejected",
+                                  "not a non-empty string")
+        elif tag not in self.allowed:
+            entry = TagAuditEntry(now, source, tag, None, "rejected",
+                                  "unknown tag (not in catalog)")
+        else:
+            entry = TagAuditEntry(now, source, tag, tag, "accepted")
+        with self._lock:
+            self._audit.append(entry)
+        return entry.accepted
+
+    def describe_whitelist(self) -> str:
+        return "Available intent tags: " + ", ".join(sorted(self.allowed))

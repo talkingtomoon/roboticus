@@ -1,36 +1,39 @@
-# 청크 스위칭: 채점기 vs 베이스라인 비교
+# 모션 선곡: 선택기 vs 베이스라인 비교
 
-phact-401 6축, S2형 시나리오 (이동 중 측면 충격 14.5~17.5 Nm, 0.3 s) × 7 시드.
-베이스라인은 DREAM-Chunk 원문의 비교 기준 차용: 무작위 선택 / 항상 첫 후보.
+phorce 목 12축, S2형 시나리오 (재생 중 충격 → 경계 재선곡) × 7 시드.
+판단 2Hz, 최대 30틱(15초) 안에 계획(approach→insert→finish) 완주 여부.
 
-| 방식 | 목표 도달률 | 평균 도달 시간 [s] | 최대 토크 평균 [Nm] | 최대 토크 최악 [Nm] |
-|---|---|---|---|---|
-| **채점기 (본 구현)** | 100% | 2.17 | 16.1 | 17.4 |
-| 무작위 선택 | 86% | 2.35 | 16.1 | 17.4 |
-| 항상 첫 후보 | 57% | 2.17 | 16.1 | 17.4 |
+| 방식 | 계획 완주율 | 평균 완주 틱 | 평균 재생 횟수 |
+|---|---|---|---|
+| **선택기 (본 구현)** | 100% | 13.0 | 4.0 |
+| 무작위 선곡 | 14% | 30.0 | 8.7 |
+| 항상 첫 슬롯 | 0% | nan | 10.0 |
+
+베이스라인은 태그/진입 자세/외란을 전부 무시한다 — 엉뚱한 자세에서
+엉뚱한 모션을 트는 것이 수치로 드러난다.
 
 ## 시드별 상세
 
-| 방식 | 시드 | 도달 | 시간 [s] | 최대토크 [Nm] | 선택 청크 |
-|---|---|---|---|---|---|
-| scorer | 0 | O | 2.26 | 15.4 | detour_left |
-| scorer | 1 | O | 2.05 | 17.4 | detour_left |
-| scorer | 2 | O | 2.26 | 15.5 | detour_left |
-| scorer | 3 | O | 2.19 | 15.3 | detour_left |
-| scorer | 4 | O | 2.19 | 16.1 | detour_left |
-| scorer | 5 | O | 2.19 | 17.0 | detour_left |
-| scorer | 6 | O | 2.05 | 15.6 | detour_left |
-| random | 0 | O | 2.26 | 15.4 | detour_left |
-| random | 1 | O | 2.05 | 17.4 | direct |
-| random | 2 | O | 2.26 | 15.5 | detour_left |
-| random | 3 | O | 2.76 | 15.3 | direct_slow |
-| random | 4 | X | nan | 16.1 | retreat |
-| random | 5 | O | 2.76 | 17.0 | direct_slow |
-| random | 6 | O | 2.05 | 15.6 | detour_left |
-| first | 0 | O | 2.26 | 15.4 | direct |
-| first | 1 | X | nan | 17.4 | retreat |
-| first | 2 | X | nan | 15.5 | retreat |
-| first | 3 | X | nan | 15.3 | retreat |
-| first | 4 | O | 2.19 | 16.1 | detour_right |
-| first | 5 | O | 2.19 | 17.0 | detour_right |
-| first | 6 | O | 2.05 | 15.6 | direct |
+| 방식 | 시드 | 완주 | 틱 | 재생 횟수 |
+|---|---|---|---|---|
+| selector | 0 | O | 13 | 4 |
+| selector | 1 | O | 13 | 4 |
+| selector | 2 | O | 13 | 4 |
+| selector | 3 | O | 13 | 4 |
+| selector | 4 | O | 13 | 4 |
+| selector | 5 | O | 13 | 4 |
+| selector | 6 | O | 13 | 4 |
+| random | 0 | X | 30 | 10 |
+| random | 1 | X | 30 | 8 |
+| random | 2 | X | 30 | 9 |
+| random | 3 | X | 30 | 8 |
+| random | 4 | X | 30 | 8 |
+| random | 5 | O | 30 | 8 |
+| random | 6 | X | 30 | 10 |
+| first | 0 | X | 30 | 10 |
+| first | 1 | X | 30 | 10 |
+| first | 2 | X | 30 | 10 |
+| first | 3 | X | 30 | 10 |
+| first | 4 | X | 30 | 10 |
+| first | 5 | X | 30 | 10 |
+| first | 6 | X | 30 | 10 |
