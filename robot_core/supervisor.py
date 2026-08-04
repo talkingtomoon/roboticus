@@ -168,6 +168,56 @@ class Supervisor:
         self.cache.mark_event(f"intent accepted: {accepted!r}/{urgency} (src={source})")
         return True
 
+    # ------------------------------------------------------------- 뷰 전용
+    def snapshot(self) -> dict:
+        """상태 스냅샷 — 웹 UI 등 외부 관찰자용. 락 잡고 dict 반환, 조작 없음.
+
+        (UI는 이 메서드 + halt/resume/request_intent만 쓴다 — 내부 접근 금지)
+        """
+        with self._pending_lock:
+            pending = self._pending
+        fb = self.cache.latest()
+        wall = self.cache.latest_wall()
+        axes = None
+        if fb is not None:
+            usable = fb.usable
+            temps = fb.temp_c[usable] if usable.any() else fb.temp_c
+            hot_ax = int(np.argmax(fb.temp_c)) if len(fb.temp_c) else -1
+            axes = {
+                "valid": int(usable.sum()),
+                "total": int(len(usable)),
+                "fault": int(fb.fault.sum()),
+                "temp_max": round(float(temps.max()), 1) if temps.size else None,
+                "temp_max_axis": hot_ax,
+            }
+        cur = None
+        if self._current_meta is not None:
+            cur = {"id": self._current_meta.id, "name": self._current_meta.name}
+        elif self._handle is not None:
+            cur = {"id": self._handle.motion_id, "name": "?"}
+        return {
+            "state": self.state.value,
+            "halt_reason": self.halt_reason,
+            "plan": {"cursor": self.plan.cursor,
+                     "total": len(self.plan.tag_sequence),
+                     "next_tag": self.plan.next_tag},
+            "current_motion": cur,
+            "pending_intent": (None if pending is None else
+                               {"tag": pending.intent_tag,
+                                "urgency": pending.urgency,
+                                "source": pending.source}),
+            "hold_rest": self._hold_rest,
+            "busy_rejections": self.busy_rejections,
+            "breaker": {f"{k[0]}:ax{k[1]}": len(v)
+                        for k, v in self._fail_times.items() if v},
+            "watchdog": {
+                "fresh_ms": (None if wall is None else
+                             round((time.monotonic() - wall) * 1e3, 1)),
+                "limit_ms": K_STATE_FRESH_LIMIT_MS,
+            },
+            "axes": axes,
+        }
+
     # ---------------------------------------------------------- 사전 점검
     def preflight(self, wait_s: float = 2.0) -> list[str]:
         """시작 전 게이트. 문제 리스트 반환 (빈 리스트 = 출발 가능).

@@ -35,13 +35,15 @@ robot_core/
   recovery/    detector.py(4종 감지) · llm_agent.py(태그 결정) ·
                safety.py(TagSafetyGuard) · rules.py(실패→태그 표)
   supervisor.py  2Hz 판단 루프 + 상태기계 (1kHz↔2Hz 분리를 구조로 강제)
+  intent/      sources.py(Typed/Whisper) · interpreter.py — 사람의 말 → 태그
+  ui/          server.py + static/ — 운용 웹 UI (FastAPI, html 한 장 + 1초 폴링)
   logging/     feedback_cache.py — 1kHz 수신과 판단 사이의 유일한 접점
   integration/ scenarios.py(리허설 5종) · timeline.py(단일 시간축)
   adapters/    phorce_ros2.py — rclpy 주석 스켈레톤 (qos_profile_sensor_data 필수)
   legacy/      임피던스 인터페이스 시절 스냅샷 (참고용 — 삭제 아님)
 scripts/       annotate_motion.py · validate_catalog.py · field_smoke.py ·
                baseline_selector_comparison.py · check_llm_model.py · legacy/
-tests/         162개 테스트, 실물·실제 API 없이 전부 통과
+tests/         186개 테스트, 실물·실제 API 없이 전부 통과
 examples/      demo_full_rehearsal.py · legacy/
 ```
 
@@ -52,7 +54,7 @@ git clone https://github.com/talkingtomoon/roboticus.git
 cd roboticus
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
-python -m pytest -q                                  # 162 tests
+python -m pytest -q                                  # 186 tests
 python examples/demo_full_rehearsal.py               # 리허설 시나리오 5종
 ```
 
@@ -171,6 +173,46 @@ python -m robot_core.integration.scenarios --scenario S5   # 타임라인 포함
   키 없음 → 미확인). 6번 단계에서 확인, 실패 시 교체. 틀려도 규칙 폴백으로 돈다.
 - ROS 2 직결이 필요해지면 [adapters/phorce_ros2.py](robot_core/adapters/phorce_ros2.py)
   스켈레톤 — **`qos_profile_sensor_data` 안 쓰면 조용히 0개 수신**한다.
+
+## 의도 입력 파이프라인 (intent/)
+
+사람의 말이 시스템에 들어오는 경로. 세 단계이고, **어느 경로든 태그는
+TagSafetyGuard를 지난다** (`request_intent()` 단일 주입점):
+
+```
+발화 ─┬─ 1) 안전 키워드 ("멈춰/정지/재개") → Supervisor.halt()/resume() 즉시
+      │      (LLM을 기다리지 않는다 — 안전 명령에 3초 지연 금지, 테스트로 강제)
+      ├─ 2) LLM: 발화 + 컨텍스트(최근 실패·계획 단계·가용 태그) → 태그
+      └─ 3) 규칙 폴백: 키워드 표 ("쉬어"→rest, "천천히 다시"→retry/slow, ...)
+```
+
+소스는 `TypedSource`(UI 텍스트창/테스트)와 `WhisperSource`(faster-whisper
+스켈레톤 — Jetson에서 `pip install faster-whisper` 후 활성화, 마이크 캡처
+루프와 모델 크기별 지연 실측 항목은 소스 독스트링에).
+
+## 운용 웹 UI (ui/)
+
+```bash
+pip install -e ".[ui]"
+python -m robot_core.ui.server --demo     # 목 월드 라이브 데모 (포트 8710)
+# 폰에서: http://<Jetson IP>:8710
+```
+
+html 한 장 + 1초 폴링 (웹소켓/프레임워크 없음). 구성:
+- **상태 배지** (재생=초록/대기=회색/사람대기=주황/정지=빨강) + 정지·재개 버튼
+  (엄지 크기, 정지는 확인 없이 즉시)
+- **파이프라인 모식도** (SVG): [피드백]→[감지] / [발화]→[해석] → [가드]→[선곡]→[재생].
+  이벤트 스트림 텍스트 분류만으로 노드가 점등(활성 초록 1.5s / 차단 빨강 0.8s),
+  노드 클릭 시 타임라인 필터. HALTED면 전체 흐림 + "정지됨" 오버레이
+- **선곡 점수표** (후보별 점수·제외 사유) + **타임라인 20건** + **텍스트 명령창**
+
+Supervisor 결합은 공개 메서드 4개뿐: `snapshot()`(뷰 전용) / `halt()` /
+`resume()` / `request_intent()`. phorce-console과 중복되는 실시간 그래프·축별
+상세는 만들지 않는다.
+
+완료 기준 시나리오가 통합 테스트로 고정돼 있다: 텍스트 "천천히 다시 해봐" →
+키워드 해석(retry/slow) → 가드 통과 → 다음 경계에서 slow 변주 선곡 —
+전 과정이 `/api/events` 타임라인에 나타난다.
 
 ## 하지 않기로 한 것 (의도적)
 

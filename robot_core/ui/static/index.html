@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>robot_core 운용</title>
+<style>
+  :root { --bg:#111418; --card:#1b2026; --line:#2c333b; --fg:#e6e9ec;
+          --dim:#8a949e; --green:#3fb950; --orange:#d29922; --red:#f85149;
+          --blue:#58a6ff; --gray:#6e7681; }
+  * { box-sizing:border-box; margin:0; }
+  body { background:var(--bg); color:var(--fg); font:15px/1.5 system-ui,
+         -apple-system, "Malgun Gothic", sans-serif; padding:12px;
+         max-width:760px; margin:0 auto; }
+  .card { background:var(--card); border:1px solid var(--line);
+          border-radius:10px; padding:12px; margin-bottom:12px; }
+  /* ---- 상단: 상태 + 버튼 ---- */
+  .top { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  #badge { font-size:20px; font-weight:700; padding:10px 18px;
+           border-radius:8px; background:var(--gray); color:#fff; }
+  #badge.PLAYING { background:var(--green); }
+  #badge.DECIDING, #badge.IDLE { background:var(--gray); }
+  #badge.WAITING_OPERATOR { background:var(--orange); }
+  #badge.HALTED { background:var(--red); }
+  #badge.DONE { background:var(--blue); }
+  .meta { color:var(--dim); font-size:13px; flex:1; min-width:140px; }
+  button { min-height:52px; min-width:96px; font-size:17px; font-weight:700;
+           border:0; border-radius:10px; cursor:pointer; padding:0 18px; }
+  #btnHalt { background:var(--red); color:#fff; }
+  #btnResume { background:var(--green); color:#fff; }
+  button:active { transform:scale(0.97); }
+  /* ---- 모식도 ---- */
+  .diagram-wrap { position:relative; }
+  .diagram-wrap.halted svg { opacity:0.25; filter:blur(1px); }
+  .halt-overlay { display:none; position:absolute; inset:0; align-items:center;
+                  justify-content:center; font-size:26px; font-weight:800;
+                  color:var(--red); letter-spacing:4px; }
+  .diagram-wrap.halted .halt-overlay { display:flex; }
+  svg text { fill:var(--fg); font-size:13px; font-weight:600; }
+  svg .sub { fill:var(--dim); font-size:10px; font-weight:400; }
+  svg .node rect { fill:#242b33; stroke:var(--line); stroke-width:1.5;
+                   rx:7; transition:stroke .3s, fill .3s; }
+  svg .node.active rect { stroke:var(--green); fill:#1c3325; }
+  svg .node.blocked rect { stroke:var(--red); fill:#3a1f22; }
+  svg .node { cursor:pointer; }
+  svg .node.filtered rect { stroke:var(--blue); stroke-width:2.5; }
+  svg .edge { stroke:var(--line); stroke-width:2; fill:none; }
+  /* ---- 점수표 / 타임라인 ---- */
+  h3 { font-size:13px; color:var(--dim); text-transform:uppercase;
+       letter-spacing:1px; margin-bottom:8px; }
+  #score { font:12px/1.45 ui-monospace, Consolas, monospace;
+           white-space:pre; overflow-x:auto; color:var(--fg); }
+  #timeline { list-style:none; font-size:13px; }
+  #timeline li { padding:4px 0; border-bottom:1px solid var(--line);
+                 display:flex; gap:8px; }
+  #timeline .t { color:var(--dim); font-family:ui-monospace, monospace;
+                 flex-shrink:0; }
+  #timeline .tag { flex-shrink:0; font-weight:700; width:44px; }
+  .c-detect { color:var(--orange); } .c-select { color:var(--blue); }
+  .c-play { color:var(--green); } .c-guard { color:#d2a8ff; }
+  .c-intent { color:#f0883e; } .c-event { color:var(--dim); }
+  #filterInfo { color:var(--blue); font-size:12px; margin-bottom:6px;
+                display:none; }
+  /* ---- 입력 ---- */
+  .inputrow { display:flex; gap:8px; }
+  #txt { flex:1; min-height:52px; font-size:17px; padding:0 14px;
+         border-radius:10px; border:1px solid var(--line);
+         background:#0d1117; color:var(--fg); }
+  #btnSend { background:var(--blue); color:#fff; }
+  #intentResult { font-size:13px; color:var(--dim); margin-top:8px;
+                  min-height:20px; }
+  #intentResult.ok { color:var(--green); }
+  #intentResult.no { color:var(--red); }
+</style>
+</head>
+<body>
+
+<div class="card top">
+  <div id="badge">--</div>
+  <div class="meta" id="meta">연결 중...</div>
+  <button id="btnHalt">정지</button>
+  <button id="btnResume">재개</button>
+</div>
+
+<div class="card diagram-wrap" id="diagramWrap">
+  <svg viewBox="0 0 720 190" width="100%" height="190">
+    <!-- 간선 -->
+    <path class="edge" d="M128 50 L168 50"/>
+    <path class="edge" d="M296 50 L340 78 "/>
+    <path class="edge" d="M296 140 L340 108"/>
+    <path class="edge" d="M128 140 L168 140"/>
+    <path class="edge" d="M470 93 L510 93"/>
+    <path class="edge" d="M598 93 L638 93"/>
+    <!-- 노드: data-node = 이벤트 매핑 키 -->
+    <g class="node" id="node-feedback" data-node="feedback">
+      <rect x="8" y="26" width="120" height="48"/>
+      <text x="68" y="46" text-anchor="middle">로봇 피드백</text>
+      <text class="sub" id="lbl-feedback" x="68" y="63" text-anchor="middle"></text>
+    </g>
+    <g class="node" id="node-detect" data-node="detect">
+      <rect x="168" y="26" width="128" height="48"/>
+      <text x="232" y="46" text-anchor="middle">감지</text>
+      <text class="sub" id="lbl-detect" x="232" y="63" text-anchor="middle"></text>
+    </g>
+    <g class="node" id="node-interpret" data-node="interpret">
+      <rect x="168" y="116" width="128" height="48"/>
+      <text x="232" y="136" text-anchor="middle">해석</text>
+      <text class="sub" id="lbl-interpret" x="232" y="153" text-anchor="middle"></text>
+    </g>
+    <g class="node" id="node-human">
+      <rect x="8" y="116" width="120" height="48"/>
+      <text x="68" y="136" text-anchor="middle">사람 발화</text>
+      <text class="sub" x="68" y="153" text-anchor="middle">텍스트/음성</text>
+    </g>
+    <g class="node" id="node-guard" data-node="guard">
+      <rect x="342" y="69" width="128" height="48"/>
+      <text x="406" y="89" text-anchor="middle">가드</text>
+      <text class="sub" id="lbl-guard" x="406" y="106" text-anchor="middle"></text>
+    </g>
+    <g class="node" id="node-select" data-node="select">
+      <rect x="510" y="69" width="88" height="48"/>
+      <text x="554" y="89" text-anchor="middle">선곡</text>
+      <text class="sub" id="lbl-select" x="554" y="106" text-anchor="middle"></text>
+    </g>
+    <g class="node" id="node-play" data-node="play">
+      <rect x="638" y="69" width="74" height="48"/>
+      <text x="675" y="89" text-anchor="middle">재생</text>
+      <text class="sub" id="lbl-play" x="675" y="106" text-anchor="middle"></text>
+    </g>
+  </svg>
+  <div class="halt-overlay">정지됨</div>
+</div>
+
+<div class="card">
+  <h3>최근 선곡 점수표</h3>
+  <div id="score">(아직 없음)</div>
+</div>
+
+<div class="card">
+  <h3>타임라인 <span id="filterInfo"></span></h3>
+  <ul id="timeline"></ul>
+</div>
+
+<div class="card">
+  <div class="inputrow">
+    <input id="txt" placeholder='명령 입력 — 예: "천천히 다시 해봐", "멈춰"'>
+    <button id="btnSend">전송</button>
+  </div>
+  <div id="intentResult"></div>
+</div>
+
+<script>
+"use strict";
+// ── 이벤트 텍스트 → 모식도 노드 매핑 (새 계측 없음 — 텍스트 분류뿐) ──
+// detect→감지, guard→가드, select→선곡, play→재생, intent→해석
+function classify(text) {
+  // returns {node, blocked, label, cls} — cls는 타임라인 색상용
+  if (text.startsWith("DETECTED")) {
+    const m = text.match(/DETECTED (\w+) joint=(\d+)/);
+    return {node:"detect", blocked:false, cls:"detect",
+            label: m ? `${m[1]} j${m[2]}` : "감지"};
+  }
+  if (text.startsWith("intent[")) {
+    const rejected = text.includes("-> 거부") || text.includes("rejected");
+    const q = text.match(/'([^']+)'/);
+    return {node: rejected ? "guard" : "interpret", blocked: rejected,
+            cls:"intent",
+            label: (rejected ? "거부: " : "") + (q ? `'${q[1]}'` : "")};
+  }
+  if (text.includes("rejected by guard") || text.startsWith("intent rejected")) {
+    const q = text.match(/'([^']+)'/);
+    return {node:"guard", blocked:true, cls:"guard",
+            label: "거부: " + (q ? `'${q[1]}'` : "?")};
+  }
+  if (text.startsWith("intent accepted")) {
+    const q = text.match(/'([^']+)'/);
+    return {node:"guard", blocked:false, cls:"guard",
+            label: "통과: " + (q ? `'${q[1]}'` : "")};
+  }
+  if (text.startsWith("recovery[")) {
+    const q = text.match(/intent='([^']+)'/);
+    return {node:"guard", blocked:false, cls:"guard",
+            label: "통과: " + (q ? `'${q[1]}'` : "")};
+  }
+  if (text.startsWith("select:")) {
+    const excluded = text.includes("EXCLUDED");
+    const chosen = text.match(/(\d+)\s+(\S+)\s+total.*<-- chosen/);
+    return {node:"select", blocked:excluded, cls:"select",
+            label: chosen ? `→ ${chosen[2]}` :
+                   (excluded ? "제외 있음" : "")};
+  }
+  if (text.startsWith("play")) {
+    const m = text.match(/motion (\d+)/);
+    return {node:"play", blocked:text.includes("ABORTED"), cls:"play",
+            label: m ? `motion ${m[1]}` : ""};
+  }
+  if (text.startsWith("HALT") || text.startsWith("operator")) {
+    return {node:null, blocked:false, cls:"event", label:""};
+  }
+  return {node:null, blocked:false, cls:"event", label:""};
+}
+
+// ── 상태 ──
+let cursor = 0;
+let allEvents = [];      // {seq,t,text,info}
+let nodeFilter = null;   // data-node 값 또는 null
+const timers = {};       // node → highlight 타임아웃
+
+function flash(node, blocked, label) {
+  const g = document.getElementById("node-" + node);
+  if (!g) return;
+  g.classList.remove("active", "blocked");
+  void g.getBoundingClientRect();          // 리플로우로 재트리거
+  g.classList.add(blocked ? "blocked" : "active");
+  clearTimeout(timers[node]);
+  timers[node] = setTimeout(() => g.classList.remove("active", "blocked"),
+                            blocked ? 800 : 1500);
+  if (label) {
+    const lbl = document.getElementById("lbl-" + node);
+    if (lbl) lbl.textContent = label.slice(0, 26);
+  }
+}
+
+// ── 폴링 ──
+async function poll() {
+  try {
+    const st = await (await fetch("/api/state")).json();
+    renderState(st);
+    const ev = await (await fetch("/api/events?since=" + cursor)).json();
+    if (ev.events.length) {
+      cursor = ev.cursor;
+      for (const e of ev.events) {
+        e.info = classify(e.text);
+        allEvents.push(e);
+        if (e.info.node) flash(e.info.node, e.info.blocked, e.info.label);
+      }
+      if (allEvents.length > 400) allEvents = allEvents.slice(-250);
+      renderTimeline();
+      renderScore();
+    }
+  } catch (err) {
+    document.getElementById("meta").textContent = "연결 끊김: " + err;
+  }
+}
+
+function renderState(st) {
+  const badge = document.getElementById("badge");
+  badge.textContent = st.state;
+  badge.className = st.state;
+  const bits = [];
+  bits.push(`계획 ${st.plan.cursor}/${st.plan.total}` +
+            (st.plan.next_tag ? ` (다음: ${st.plan.next_tag})` : " 완료"));
+  if (st.current_motion) bits.push(`재생: #${st.current_motion.id} ${st.current_motion.name}`);
+  if (st.axes) bits.push(`온도max ${st.axes.temp_max}°C(ax${st.axes.temp_max_axis})` +
+                         ` · valid ${st.axes.valid}/${st.axes.total}`);
+  if (st.watchdog.fresh_ms != null)
+    bits.push(`피드백 ${st.watchdog.fresh_ms|0}ms전`);
+  if (st.halt_reason) bits.push(`사유: ${st.halt_reason}`);
+  const br = Object.entries(st.breaker || {});
+  if (br.length) bits.push("브레이커 " + br.map(([k,v]) => `${k}×${v}`).join(","));
+  document.getElementById("meta").textContent = bits.join("  ·  ");
+  document.getElementById("diagramWrap").classList.toggle(
+    "halted", st.state === "HALTED");
+  // 피드백 노드: 신선하면 은은히 활성
+  if (st.watchdog.fresh_ms != null && st.watchdog.fresh_ms < st.watchdog.limit_ms) {
+    const g = document.getElementById("node-feedback");
+    g.classList.add("active");
+    document.getElementById("lbl-feedback").textContent =
+      (st.watchdog.fresh_ms|0) + " ms";
+  } else {
+    document.getElementById("node-feedback").classList.remove("active");
+  }
+}
+
+function renderTimeline() {
+  const ul = document.getElementById("timeline");
+  let evs = allEvents;
+  if (nodeFilter) evs = evs.filter(e => e.info.node === nodeFilter);
+  ul.innerHTML = evs.slice(-20).reverse().map(e =>
+    `<li><span class="t">${e.t.toFixed(2)}</span>` +
+    `<span class="tag c-${e.info.cls}">${e.info.node || "·"}</span>` +
+    `<span>${escapeHtml(e.text)}</span></li>`).join("");
+}
+
+function renderScore() {
+  // 마지막 [SELECT] 블록 (select: 접두 연속 라인들)을 점수표로
+  const lines = [];
+  for (let i = allEvents.length - 1; i >= 0; i--) {
+    const t = allEvents[i].text;
+    if (t.startsWith("select:")) {
+      lines.unshift(t.slice(7).trim());
+      if (t.includes("[SELECT]")) break;
+    } else if (lines.length) break;
+  }
+  if (lines.length)
+    document.getElementById("score").textContent = lines.join("\n");
+}
+
+function escapeHtml(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// ── 조작 ──
+document.getElementById("btnHalt").onclick = async () => {
+  await fetch("/api/halt", {method:"POST", headers:{"Content-Type":"application/json"},
+                            body: JSON.stringify({reason:"web UI 정지 버튼"})});
+  poll();
+};
+document.getElementById("btnResume").onclick = async () => {
+  if (!confirm("재개할까요? 로봇이 다시 움직입니다.")) return;
+  await fetch("/api/resume", {method:"POST"});
+  poll();
+};
+async function sendIntent() {
+  const txt = document.getElementById("txt");
+  const text = txt.value.trim();
+  if (!text) return;
+  txt.value = "";
+  const r = await (await fetch("/api/intent", {
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({text})})).json();
+  const el = document.getElementById("intentResult");
+  el.className = r.accepted ? "ok" : "no";
+  el.textContent = r.accepted
+    ? `✓ ${r.action}` + (r.tag ? `: ${r.tag}/${r.urgency}` : "") + ` [${r.path}]`
+    : `✗ 거부 — ${r.detail || r.action}`;
+  poll();
+}
+document.getElementById("btnSend").onclick = sendIntent;
+document.getElementById("txt").addEventListener("keydown",
+  e => { if (e.key === "Enter") sendIntent(); });
+
+// 노드 클릭 → 타임라인 필터
+for (const g of document.querySelectorAll(".node[data-node]")) {
+  g.addEventListener("click", () => {
+    const n = g.dataset.node;
+    nodeFilter = (nodeFilter === n) ? null : n;
+    for (const x of document.querySelectorAll(".node"))
+      x.classList.toggle("filtered", x.dataset.node === nodeFilter);
+    const fi = document.getElementById("filterInfo");
+    fi.style.display = nodeFilter ? "inline" : "none";
+    fi.textContent = nodeFilter ? `— ${nodeFilter} 필터 (다시 클릭해 해제)` : "";
+    renderTimeline();
+  });
+}
+
+poll();
+setInterval(poll, 1000);
+</script>
+</body>
+</html>

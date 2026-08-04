@@ -13,10 +13,11 @@ dependencies = ["numpy", "pyyaml"]
 #   pip install anthropic  +  환경변수 ANTHROPIC_API_KEY
 
 [project.optional-dependencies]
-dev = ["pytest"]
-# MLP 델타 모델 학습용 (물리 모델·추론은 torch 없이 동작):
-#   pip install torch --index-url https://download.pytorch.org/whl/cpu
-delta-mlp = ["torch"]
+dev = ["pytest", "fastapi", "uvicorn", "httpx"]
+# 운용 웹 UI (Jetson에서 폰/노트북 브라우저 접속):
+ui = ["fastapi", "uvicorn"]
+# 음성 의도 입력 (Jetson 로컬 STT — WhisperSource 활성화):
+stt = ["faster-whisper"]
 
 [tool.setuptools.packages.find]
 include = ["robot_core*"]

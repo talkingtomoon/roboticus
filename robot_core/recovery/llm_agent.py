@@ -52,6 +52,35 @@ class LLMUnavailable(Exception):
     """LLM 경로를 못 쓰는 모든 사유. 메시지가 폴백 사유 라벨이 된다."""
 
 
+def call_client_with_timeout(client, system: str, user: str,
+                             timeout_s: float) -> str:
+    """클라이언트 호출을 데몬 스레드로 감싸 하드 타임아웃을 건다.
+
+    회복 에이전트와 의도 해석기가 공유하는 유일한 LLM 호출 경로 —
+    타임아웃/에러/빈 응답 처리를 한 곳에서 한다.
+    """
+    result: dict = {}
+    done = threading.Event()
+
+    def target():
+        try:
+            result["ok"] = client(system, user)
+        except Exception as e:
+            result["err"] = e
+        done.set()
+
+    threading.Thread(target=target, daemon=True, name="llm-call").start()
+    if not done.wait(timeout_s):
+        raise LLMUnavailable(f"timeout after {timeout_s}s")
+    if "err" in result:
+        raise LLMUnavailable(
+            f"client error: {type(result['err']).__name__}: {result['err']}")
+    text = result.get("ok")
+    if not isinstance(text, str) or not text.strip():
+        raise LLMUnavailable("empty response")
+    return text
+
+
 class AnthropicChatClient:
     """실제 Anthropic API 클라이언트. (system, user) -> 응답 텍스트.
 
@@ -289,30 +318,14 @@ class LLMRecoveryAgent:
 
     # ------------------------------------------------------------ LLM 호출
     def _call_with_timeout(self, event: FailureEvent) -> str:
-        """클라이언트 호출을 데몬 스레드로 감싸 하드 타임아웃을 건다."""
-        system = SYSTEM_PROMPT
-        user = self._build_prompt(event)
-        result: dict = {}
-        done = threading.Event()
-
-        def target():
-            try:
-                result["ok"] = self.client(system, user)
-            except Exception as e:
-                result["err"] = e
-            done.set()
-
-        threading.Thread(target=target, daemon=True, name="llm-call").start()
-        if not done.wait(self.config.timeout_s):
-            self.stats["llm_timeout"] += 1
-            raise LLMUnavailable(f"timeout after {self.config.timeout_s}s")
-        if "err" in result:
-            raise LLMUnavailable(
-                f"client error: {type(result['err']).__name__}: {result['err']}")
-        text = result.get("ok")
-        if not isinstance(text, str) or not text.strip():
-            raise LLMUnavailable("empty response")
-        return text
+        try:
+            return call_client_with_timeout(
+                self.client, SYSTEM_PROMPT, self._build_prompt(event),
+                self.config.timeout_s)
+        except LLMUnavailable as e:
+            if "timeout" in str(e):
+                self.stats["llm_timeout"] += 1
+            raise
 
     def _build_prompt(self, event: FailureEvent) -> str:
         parts = ["FAILURE EVENT", event.describe(), ""]

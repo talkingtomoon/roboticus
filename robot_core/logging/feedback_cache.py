@@ -26,6 +26,7 @@ from robot_core.hal.phorce import N_AXES, PhorceFeedback
 class _Event:
     t: float
     text: str
+    seq: int = 0     # 단조 증가 커서 — deque가 오래된 것을 버려도 안 흔들린다
 
 
 class FeedbackCache:
@@ -49,6 +50,7 @@ class FeedbackCache:
         self._latest: PhorceFeedback | None = None
         self._latest_wall: float | None = None
         self._events: deque[_Event] = deque(maxlen=300)
+        self._event_seq = 0
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------ 1kHz 경로
@@ -102,15 +104,22 @@ class FeedbackCache:
     def mark_event(self, text: str, t: float | None = None) -> None:
         if t is None:
             t = self._latest.t if self._latest is not None else 0.0
-        self._events.append(_Event(t=float(t), text=str(text)))
+        self._event_seq += 1
+        self._events.append(_Event(t=float(t), text=str(text),
+                                   seq=self._event_seq))
         if self._event_log is not None:
             import json
             self._event_log.write(json.dumps(
-                {"t": float(t), "wall": time.monotonic(), "text": str(text)},
+                {"seq": self._event_seq, "t": float(t),
+                 "wall": time.monotonic(), "text": str(text)},
                 ensure_ascii=False) + "\n")
 
     def events(self) -> list:
         return list(self._events)
+
+    def events_since(self, after_seq: int = 0) -> list:
+        """seq > after_seq 인 이벤트만 (웹 UI 폴링 커서용)."""
+        return [e for e in self._events if e.seq > int(after_seq)]
 
     def close(self) -> None:
         if self._event_log is not None:
