@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>robot_core — phorce 재생 로봇 코어 인프라</title>
+<style>
+  :root { --bg:#eef1f4; --panel:#fff; --line:#d5dbe1; --fg:#1c2430;
+          --dim:#5c6b7a; --accent:#2f6feb; --accent-fg:#fff; --chip:#e6ecf5; }
+  @media (prefers-color-scheme: dark) { :root {
+    --bg:#0a0d10; --panel:#12161b; --line:#242b33; --fg:#e6e9ec;
+    --dim:#8a949e; --accent:#58a6ff; --accent-fg:#0a0d10; --chip:#16202e; } }
+  * { box-sizing:border-box; margin:0; }
+  body { background:var(--bg); color:var(--fg); line-height:1.6;
+         font:16px system-ui, -apple-system, "Malgun Gothic", sans-serif; }
+  .wrap { max-width:720px; margin:0 auto; padding:44px 20px 60px; }
+  h1 { font-size:27px; font-weight:800; text-wrap:balance; }
+  .tag { color:var(--dim); margin-top:6px; }
+  code { font:13px ui-monospace, Consolas, monospace; background:var(--chip);
+         padding:2px 6px; border-radius:5px; }
+  .cta { display:block; background:var(--panel); border:1px solid var(--line);
+         border-left:5px solid var(--accent); border-radius:12px;
+         padding:18px 20px; margin:26px 0 14px; text-decoration:none;
+         color:inherit; }
+  .cta:hover { border-color:var(--accent); }
+  .cta b { font-size:19px; color:var(--accent); }
+  .cta span { display:block; color:var(--dim); font-size:14px; margin-top:4px; }
+  ul { margin:18px 0 0 20px; }
+  li { padding:3px 0; }
+  a { color:var(--accent); }
+  .note { color:var(--dim); font-size:13.5px; margin-top:26px;
+          border-top:1px solid var(--line); padding-top:16px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>robot_core</h1>
+  <div class="tag">phorce 재생 로봇의 “관찰 → 판단 → 선곡” 코어 인프라 ·
+    실물 없이 <code>pytest</code>만으로 검증</div>
+
+  <a class="cta" href="demo/">
+    <b>운용 UI 리뷰 데모 →</b>
+    <span>실제 대시보드와 운용자 페이지를 목 로봇 세션 녹화로 재생합니다.
+      폰으로 열어도 됩니다.</span>
+  </a>
+
+  <ul>
+    <li><a href="https://github.com/talkingtomoon/roboticus">저장소</a> ·
+        <a href="https://github.com/talkingtomoon/roboticus#readme">README</a></li>
+    <li><a href="https://github.com/talkingtomoon/roboticus/blob/main/docs/baseline_comparison.md">선곡
+        베이스라인 비교표</a></li>
+    <li><a href="https://github.com/talkingtomoon/roboticus/blob/main/CONTRIBUTING.md">현장
+        작업 규칙</a></li>
+  </ul>
+
+  <p class="note">데모 페이지는 <code>python scripts/build_ui_demo.py</code>로
+  재생성됩니다 — UI 코드(<code>ui/static/*.html</code>)를 그대로 읽어 네트워크
+  폴링만 녹화 재생으로 바꾸므로, 보이는 화면이 실물과 같습니다.
+  실배포는 젯슨에서 <code>python -m robot_core.ui.server</code>.</p>
+</div>
+</body>
+</html>
