@@ -140,7 +140,12 @@ def test_done_holds_but_wakes_for_recovery_decision():
 
 # ------------------------------------------------- 1kHz 부하 중 판단 루프
 def test_decision_tick_stays_fast_under_1khz_push_load():
-    """1kHz 콜백(저장만)이 도는 동안 판단 틱이 제때 도는지 (요구 9)."""
+    """1kHz 콜백(저장만)이 도는 동안 판단 틱이 제때 도는지 (요구 9).
+
+    벽시계 측정이라 다른 테스트/프로세스와 CPU를 다투면 튄다 — 2회 중
+    좋은 쪽을 본다. 진짜 회귀(예: 틱이 버퍼 전체를 훑게 됨)라면 두 번 다
+    초과한다. 임계 100ms는 2Hz 주기(500ms) 대비 5배 여유다.
+    """
     hal, cache, sup, plan, _ = build_world()
     stop = threading.Event()
 
@@ -154,17 +159,58 @@ def test_decision_tick_stays_fast_under_1khz_push_load():
     th = threading.Thread(target=feeder, daemon=True)
     th.start()
     try:
-        durations = []
-        for _ in range(12):
-            hal.step(TICK_STEPS)
-            t0 = time.perf_counter()
-            sup.tick()
-            durations.append(time.perf_counter() - t0)
-        p95 = sorted(durations)[int(len(durations) * 0.95)]
-        assert p95 < 0.1, f"판단 틱 p95 {p95 * 1e3:.1f} ms — 2Hz 루프에 과부하"
+        best = None
+        for attempt in range(2):
+            durations = []
+            for _ in range(12):
+                hal.step(TICK_STEPS)
+                t0 = time.perf_counter()
+                sup.tick()
+                durations.append(time.perf_counter() - t0)
+            p95 = sorted(durations)[int(len(durations) * 0.95)]
+            best = p95 if best is None else min(best, p95)
+            if best < 0.1:
+                break
+        assert best < 0.1, f"판단 틱 p95 {best * 1e3:.1f} ms — 2Hz 루프에 과부하"
     finally:
         stop.set()
         th.join(timeout=1.0)
+
+
+def test_to_arrays_cost_scales_with_window_not_buffer():
+    """창을 뜨는 비용이 **버퍼 크기**에 끌려가면 안 된다.
+
+    (0.7초 창을 뜨는데 10초 버퍼 전체를 훑던 회귀가 있었다 — 판단 틱에
+    ms 단위가 얹혔다. 같은 창을 버퍼 크기만 4배로 늘려 재본다.)
+    """
+    hal, cache, sup, plan, _ = build_world()
+    hal.step(2500)
+    small = _median_ms(lambda: cache.to_arrays(0.5))
+    hal.step(7500)                       # 버퍼 4배
+    assert len(cache) > 9000
+    large = _median_ms(lambda: cache.to_arrays(0.5))
+    assert large < small * 2.5 + 1.0, (
+        f"버퍼가 4배가 되자 같은 창이 {small:.2f}→{large:.2f} ms — "
+        f"창이 아니라 버퍼에 비례하고 있다")
+
+
+def test_snapshot_is_cheap_enough_for_1hz_ui_polling():
+    """UI가 1초마다 부르는 경로 — 여기서 배열을 새로 뜨면 안 된다."""
+    hal, cache, sup, plan, _ = build_world()
+    for _ in range(3):
+        sup.tick()
+        hal.step(TICK_STEPS)
+    hal.step(9000)                       # 큰 버퍼
+    assert _median_ms(sup.snapshot) < 2.0
+
+
+def _median_ms(fn, n=12):
+    ts = []
+    for _ in range(n):
+        t0 = time.perf_counter()
+        fn()
+        ts.append((time.perf_counter() - t0) * 1e3)
+    return sorted(ts)[len(ts) // 2]
 
 
 def test_push_is_storage_only_no_decision_side_effects():

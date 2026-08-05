@@ -121,6 +121,7 @@ class Supervisor:
         self.busy_rejections = 0         # 재생 중 play 시도 (0이어야 정상)
         self.no_candidate_ticks = 0
         self.last_arrival: dict | None = None   # 직전 재생의 도달 판정 (뷰용)
+        self._dob_peak: tuple | None = None     # (peak, axis) — _observe가 갱신
         self._thread: threading.Thread | None = None
         self._stop_evt = threading.Event()
 
@@ -189,18 +190,45 @@ class Supervisor:
             usable = fb.usable
             temps = fb.temp_c[usable] if usable.any() else fb.temp_c
             hot_ax = int(np.argmax(fb.temp_c)) if len(fb.temp_c) else -1
+            # 외란은 **최근 창의 피크**로 본다 — 충격은 수백 ms 과도 신호라
+            # 순간값만 보면 2Hz 관측 사이로 빠져나간다.
+            # 값은 _observe()가 감지기용 배열에서 한 번에 계산해 둔 것을 읽는다
+            # (여기서 to_arrays를 또 부르면 틱마다 버퍼를 두 번 훑게 된다)
+            if self._dob_peak is not None:
+                dob_max, dob_ax = self._dob_peak
+            else:
+                dob = np.where(usable, np.abs(fb.dob_a), 0.0)
+                dob_ax = int(np.argmax(dob)) if dob.size else -1
+                dob_max = float(dob[dob_ax]) if dob.size else 0.0
+            busv = fb.bus_v[usable] if usable.any() else fb.bus_v
             axes = {
                 "valid": int(usable.sum()),
                 "total": int(len(usable)),
                 "fault": int(fb.fault.sum()),
                 "temp_max": round(float(temps.max()), 1) if temps.size else None,
                 "temp_max_axis": hot_ax,
+                # 외란 관측기 — 접촉/충격의 1차 신호 (UI 입력 패널이 쓴다).
+                # 최근 lookback 창의 피크 (순간값 아님)
+                "dob_max": round(dob_max, 2),
+                "dob_max_axis": dob_ax,
+                "bus_v_min": round(float(busv.min()), 1) if busv.size else None,
+                "seq": int(fb.seq),
             }
         cur = None
         if self._current_meta is not None:
-            cur = {"id": self._current_meta.id, "name": self._current_meta.name}
+            m = self._current_meta
+            cur = {"id": m.id, "name": m.name, "tags": list(m.tags),
+                   "duration_s": round(float(m.duration_s), 2)}
         elif self._handle is not None:
-            cur = {"id": self._handle.motion_id, "name": "?"}
+            cur = {"id": self._handle.motion_id, "name": "?", "tags": [],
+                   "duration_s": None}
+        if cur is not None and self._handle is not None \
+                and self._handle.t_start is not None and fb is not None:
+            # 재생 진행률 — 로봇 클록 기준 (없으면 None)
+            elapsed = max(0.0, float(fb.t) - float(self._handle.t_start))
+            cur["elapsed_s"] = round(elapsed, 2)
+            if cur.get("duration_s"):
+                cur["progress"] = round(min(1.0, elapsed / cur["duration_s"]), 3)
         return {
             "state": self.state.value,
             "halt_reason": self.halt_reason,
@@ -356,6 +384,7 @@ class Supervisor:
         arrays = self.cache.to_arrays(self.cfg.detector_window_s)
         if len(arrays["t"]) < 3:
             return
+        self._update_dob_peak(arrays)
         for ev in self.detector.check(arrays):
             self.cache.mark_event(f"DETECTED {ev.describe()}", t=ev.t)
             if ev.type == FailureType.OVERHEAT_CLEARED:
@@ -404,6 +433,21 @@ class Supervisor:
             elif self.cfg.sync_recovery:
                 self.agent.process_pending()
         return False
+
+    def _update_dob_peak(self, arrays: dict) -> None:
+        """감지기용 배열에서 외란 피크를 한 번에 뽑아 둔다 (UI 입력 패널용).
+
+        감지기의 lookback 창과 같은 구간을 보므로, 패널의 수치와 감지 발화가
+        같은 이야기를 한다.
+        """
+        t = arrays["t"]
+        lb = self.detector.cfg.impact_lookback_s
+        m = t >= (t[-1] - lb)
+        dw = np.where(arrays["valid"][m], np.abs(arrays["dob"][m]), 0.0)
+        if dw.size:
+            flat = int(dw.argmax())
+            self._dob_peak = (round(float(dw.flat[flat]), 2),
+                              int(flat % dw.shape[1]))
 
     def _on_decision(self, decision: TagDecision, event) -> None:
         """결정 수신 (에이전트 워커/외부 의도 — 어느 스레드든). 최신 결정만 유지."""

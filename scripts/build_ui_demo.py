@@ -22,6 +22,7 @@ sys.path.insert(0, str(ROOT))
 from robot_core.integration.scenarios import TICK_STEPS, build_world  # noqa: E402
 from robot_core.intent import IntentInterpreter, TypedSource  # noqa: E402
 from robot_core.ui.guidance import compute_guidance  # noqa: E402
+from robot_core.ui.server import build_inputs_block  # noqa: E402
 
 OUT = ROOT / "docs" / "demo" / "index.html"
 
@@ -41,6 +42,8 @@ def record_session() -> dict:
         ev = [{"seq": i + 1, "t": round(e.t, 3), "text": e.text}
               for i, e in enumerate(cache.events())]
         s = sup.snapshot()
+        # 서버의 /api/state와 동일하게 입력 블록을 붙인다 (UI 입력 패널이 쓴다)
+        s["inputs"] = build_inputs_block(s, interp)
         frames.append({"state": s, "events": ev,
                        "guidance": compute_guidance(s, ev)})
         if note:

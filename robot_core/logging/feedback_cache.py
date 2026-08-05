@@ -55,11 +55,18 @@ class FeedbackCache:
 
     # ------------------------------------------------------------ 1kHz 경로
     def push(self, frame: PhorceFeedback) -> None:
-        """수신 콜백 전용. 저장만 한다 — 여기에 판단을 넣지 말 것."""
-        self._frames.append(frame)      # deque append는 원자적
-        self._latest = frame
-        # 수신 벽시계 스탬프 — 워치독의 신선도 기준 (로봇 클록과 독립)
-        self._latest_wall = time.monotonic()
+        """수신 콜백 전용. 저장만 한다 — 여기에 판단을 넣지 말 것.
+
+        락을 잡는다: deque append 자체는 CPython에서 원자적이지만, 느린 쪽이
+        스냅샷을 뜨는 동안의 변형은 구현 의존 동작이다. 1kHz에서 락 획득은
+        수십 ns라 무시할 만하고, 대신 스레드 안전이 구현 세부가 아니라
+        계약이 된다.
+        """
+        with self._lock:
+            self._frames.append(frame)
+            self._latest = frame
+            # 수신 벽시계 스탬프 — 워치독의 신선도 기준 (로봇 클록과 독립)
+            self._latest_wall = time.monotonic()
 
     # ------------------------------------------------------------ 느린 경로
     def latest(self) -> PhorceFeedback | None:
@@ -86,7 +93,13 @@ class FeedbackCache:
                     "playing": np.zeros(0, dtype=bool)}
         cutoff = frames[-1].t - (self.window_sec if window_sec is None
                                  else float(window_sec))
-        frames = [f for f in frames if f.t >= cutoff]
+        # 뒤에서부터 스캔해 창 밖에서 멈춘다 — 버퍼 전체를 훑지 않는다.
+        # (프레임은 시간순이라 첫 이탈 지점이 곧 경계. 창 0.7s를 뜨는데
+        #  10초 버퍼 전체를 필터하면 판단 틱이 ms 단위로 무거워진다)
+        i = len(frames) - 1
+        while i >= 0 and frames[i].t >= cutoff:
+            i -= 1
+        frames = frames[i + 1:]
         return {
             "t": np.array([f.t for f in frames]),
             "seq": np.array([f.seq for f in frames], dtype=int),
