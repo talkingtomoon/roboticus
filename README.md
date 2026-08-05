@@ -29,7 +29,8 @@
 ```
 robot_core/
   hal/         phorce.py — PhorceHAL 경계 + MockPhorceHAL(재생 시뮬 + 주입 API)
-               real_phorce.py — 파사드 래퍼 골격 (매핑 5지점 + 거절코드 변환표)
+               real_phorce.py — 파사드 실구현 (play_async/status/doctor/motions,
+               거절코드 숫자 분류, REJECTED 죽은 분기 없음)
                mock.py — 12축 관절 동역학 엔진 (목의 물리)
   catalog/     motion_catalog.py — 교시 모션 메타데이터 (JSON, 적재 슬롯 대조)
   switching/   selector.py — 모션 선택기 · baselines.py — 무작위/첫슬롯
@@ -40,11 +41,14 @@ robot_core/
   ui/          server.py + static/(대시보드·/op) + guidance.py(안내 번역표)
   logging/     feedback_cache.py — 1kHz 수신과 판단 사이의 유일한 접점
   integration/ scenarios.py(리허설 5종) · timeline.py(단일 시간축)
-  adapters/    phorce_ros2.py — rclpy 주석 스켈레톤 (qos_profile_sensor_data 필수)
+  adapters/    phorce_ros2.py — /phorce/feedback 구독 브리지 실구현
+               (qos_profile_sensor_data 필수 · recv_monotonic_ns 시간축 ·
+               rclpy는 지연 import — 개발 PC에서도 모듈 로드 가능)
   legacy/      임피던스 인터페이스 시절 스냅샷 (참고용 — 삭제 아님)
 scripts/       annotate_motion.py · validate_catalog.py · field_smoke.py ·
                baseline_selector_comparison.py · check_llm_model.py · legacy/
-tests/         211개 테스트, 실물·실제 API 없이 전부 통과
+tests/         240개 테스트, 실물·실제 API 없이 전부 통과
+               (test_real_phorce.py — 파사드 시그니처 대조 fake 포함)
 examples/      demo_full_rehearsal.py · legacy/
 ```
 
@@ -55,7 +59,7 @@ git clone https://github.com/talkingtomoon/roboticus.git
 cd roboticus
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
-python -m pytest -q                                  # 211 tests
+python -m pytest -q                                  # 240 tests
 python examples/demo_full_rehearsal.py               # 리허설 시나리오 5종
 ```
 
@@ -72,7 +76,7 @@ LLM 경로를 쓰려면 `pip install anthropic` + `ANTHROPIC_API_KEY` — **없�
 | 재생 중 play = BUSY(5) | 경계 확인 후에만 선곡 — BUSY 발생 자체가 버그 | `test_no_busy_storm...` (호출 수 = 재생 수) |
 | 12/13 거절 = 사람 개입 | `WAITING_OPERATOR` 상태 — `operator_cleared()` 전 재시도 금지 | `test_operator_rejection_waits...` |
 | valid=False 축 신뢰 금지 | 감지기·선택기 모두 valid 마스크 전제 | `test_invalid_axis_excluded...` |
-| 경계 감지 1차 = 핸들 완료 | `play_async` 핸들 이벤트, is_busy 폴링은 유실 폴백 | `test_boundary_fallback...` |
+| 경계 감지 1차 = 핸들 완료 | `play_async` 핸들 이벤트. 유실 폴백은 `busy_state()`(=`robot.status().state_name`) — "IDLE"만 유휴의 증거, STALE/UNKNOWN이면 판단 보류. motion_slot_state 폴링 금지 | `test_boundary_fallback...` |
 | 피드백 신선도 `kStateFreshLimitMs=1500` | 워치독 — 수신 벽시계 정체 시 자동 halt (마지막 프레임으로 계속 판단 금지) | `test_watchdog_halts...` |
 
 ## 안전 계열 (2026-08-05 추가)
@@ -152,6 +156,25 @@ python examples/demo_full_rehearsal.py            # 전체
 python -m robot_core.integration.scenarios --scenario S5   # 타임라인 포함
 ```
 
+## 캠프 시동 절차 (순서 엄격 — 문서 확정)
+
+로봇을 만지기 전에, 매번 이 순서대로:
+
+```
+1) 로봇(pcm·phact) 전원 ON            ← 반드시 먼저
+2) cat /sys/class/net/eno1/operstate   → "up" 확인
+3) [터미널1] ros2 run agx_phorce_bridge phorce_monitor --ros-args \
+       -p nic:=eno1 -p mode:=command -p axes:=2 -p mbx_enabled:=true
+   → 13개 자가검사 전부 PASS 확인. 켜 둔 채로 유지
+4) [터미널2] ros2 run agx_motion_slot motion_action_server --ros-args -p backend:=ecat
+5) [터미널3] 여기서 작업 (스모크/감독 루프/UI)
+```
+
+- **로봇을 껐다 켜면 터미널1도 Ctrl+C 후 재실행** (부팅 시 1회만 읽는다)
+- 영점 버튼(1번) 0.6초 이상 누름 → **3초 대기** 후에야 모션 수신 가능
+- 알려진 현상: 버튼 복구 직후 첫 재생이 error=17로 중단될 수 있다 —
+  **한 번 더 보내면 된다** (guidance 번역표에도 있음. 시스템은 자동 재선곡)
+
 ## 캠프 1일차 체크리스트
 
 전제: Jetson AGX에 이 저장소 + venv (`pip install -e ".[dev]"`) + phorce SDK.
@@ -159,11 +182,12 @@ python -m robot_core.integration.scenarios --scenario S5   # 타임라인 포함
 | # | 할 일 | 명령/파일 | 예상 소요 |
 |---|---|---|---|
 | 0 | 짐 풀기 전 — 전체 테스트/리허설이 지금도 도는지 | `pytest -q` + `python examples/demo_full_rehearsal.py` | 5분 |
-| 1 | **현장 호환성 스모크** — 파사드 가정 6개 실측 (sim:demo 대상) | `python scripts/field_smoke.py` | 10분 |
-| 2 | RealPhorceHAL 완성 — 매핑 5지점(M1~M5)만 채우면 됨. 각 지점에 검증 스모크 항목(A1~A6) 명시돼 있음 | [robot_core/hal/real_phorce.py](robot_core/hal/real_phorce.py) | 30–60분 |
+| 1 | 시동 절차 (위 섹션) — phorce_monitor 13개 PASS까지 | 터미널1·2 | 10분 |
+| 2 | **현장 스모크 A1~A5 (읽기 전용 — 로봇 안 움직임)** — 연결/doctor/상태/적재목록/피드백 실측 | `python scripts/field_smoke.py` | 10분 |
+| 2.5 | 스모크 A6 (쓰기) — 안전 모션 1개로 핸들 완료 지연 실측 | `python scripts/field_smoke.py --allow-motion <id>` + 대화형 확인 | 5분 |
 | 3 | 교시된 모션 주석 달기 (모션당 1회 재생) | `python scripts/annotate_motion.py --id N --name ... --tags ...` | 모션당 2분 |
 | 3.5 | **교시 세션 끝나기 전에** 카탈로그·계획 정적 검증 (오타/커버리지/회피 양방향/모션 길이) — 문제는 지금 알아야 다시 가르칠 시간이 있다 | `python scripts/validate_catalog.py --catalog catalog.json --plan approach,insert,...` | 2분 |
-| 4 | 감지 임계 반영 — 스모크 A6이 제안한 값으로 | [recovery/detector.py](robot_core/recovery/detector.py) `DetectorConfig` | 5분 |
+| 4 | 감지 임계 반영 — 스모크 A5가 제안한 값으로 | [recovery/detector.py](robot_core/recovery/detector.py) `DetectorConfig` | 5분 |
 | 5 | 임무 계획 정의 — 태그 시퀀스 | `MissionPlan([...])` | 5분 |
 | 6 | LLM 경로 점검 (키 설정 후 모델 문자열 검증) | `python scripts/check_llm_model.py` | 5분 |
 | 7 | 실물 축소 리허설 — 안전한 모션 2개로 S1부터 | `Supervisor` + `sync_recovery=False` + `agent.start()` | 30분 |
@@ -173,8 +197,9 @@ python -m robot_core.integration.scenarios --scenario S5   # 타임라인 포함
   (동기 모드는 결정적 리허설/테스트용이다).
 - `LLMConfig.model = "claude-opus-5"`는 **API로 검증되지 않았다** (개발 환경에
   키 없음 → 미확인). 6번 단계에서 확인, 실패 시 교체. 틀려도 규칙 폴백으로 돈다.
-- ROS 2 직결이 필요해지면 [adapters/phorce_ros2.py](robot_core/adapters/phorce_ros2.py)
-  스켈레톤 — **`qos_profile_sensor_data` 안 쓰면 조용히 0개 수신**한다.
+- 피드백 구독은 [adapters/phorce_ros2.py](robot_core/adapters/phorce_ros2.py)
+  브리지가 담당 — **`qos_profile_sensor_data` 안 쓰면 조용히 0개 수신**한다
+  (브리지가 이미 쓰고 있다. 직접 구독을 새로 만들지 말 것).
 
 ## 의도 입력 파이프라인 (intent/)
 
@@ -227,11 +252,16 @@ E-stop: "전원 재시작 필요" 등) + [🛑 멈춰][▶ 재개][✅ 해결했
 키워드 해석(retry/slow) → 가드 통과 → 다음 경계에서 slow 변주 선곡 —
 전 과정이 `/api/events` 타임라인에 나타난다.
 
-## 하지 않기로 한 것 (의도적)
+## 하지 않기로 한 것 (의도적 + 문서가 금지한 것)
 
-- 저수준 API 우회 — 의도적 비공개라고 명시됨. 시도하지 않는다
+- 참가자 비공개 API 접근 금지: `SubmitMotionRequest`, `/phorce/aperiodic`,
+  `PhorceCommand`, phorce_monitor 설정 변경
+- `motion_slot_state` 폴링으로 발사 타이밍 재는 루프 금지 — 경계는 핸들 완료,
+  폴백은 `robot.status().state_name == "IDLE"` 한 번뿐
+- CPU 8~11번에 프로세스 고정 금지 (로봇 통신 전용 격리 코어)
+- `play(0)` 금지, 한 요청에 id 2개 이상 금지 (`MAX_SEQUENCE_LENGTH=1`)
 - 모션 파일(CSV) 생성 — phorce Studio 전용
-- rclpy 실제 import — 주석 스켈레톤만
+- rclpy 모듈 수준 import 금지 — 브리지는 지연 import (개발 PC에서도 로드 가능)
 - 스위칭/선곡 판단에 신경망 — 순수 기하 + 메타데이터. LLM은 태그 선정(초 단위)만
 - 테스트에서 실제 LLM API 호출 — 전부 주입된 fake client
 
@@ -248,4 +278,4 @@ E-stop: "전원 재시작 필요" 등) + [🛑 멈춰][▶ 재개][✅ 해결했
   못 갔어도 핸들은 완료된다. "완료 ≠ 성공"의 판별은 감지기(스톨)와 다음 선곡의
   진입 필터가 맡는다.
 - 온도 모델은 1차 근사 (전류² 발열 - 선형 냉각) — OVERHEAT 경로 검증용이지
-  열 예측용이 아니다. 실물 임계는 스모크 A6 분포를 보고 정한다.
+  열 예측용이 아니다. 실물 임계는 스모크 A5 분포를 보고 정한다.

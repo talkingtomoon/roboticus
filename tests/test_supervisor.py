@@ -60,6 +60,36 @@ def test_operator_rejection_waits_without_auto_retry():
     assert plan.done
 
 
+def test_hardware_rejection_halts_with_detail():
+    """코드 6/11(하드웨어)은 id를 바꿔도 소용없다 — 재선곡 루프 대신 HALT,
+    파사드 detail(한국어)이 halt 사유와 스냅샷에 실린다."""
+    hal, cache, sup, plan, _ = build_world()
+    hal.set_rejection(6, detail="EtherCAT 통신이 끊겼습니다. 케이블을 확인하세요.")
+    run_ticks(hal, sup, 4)
+
+    assert sup.state == SupervisorState.HALTED
+    assert "code 6" in sup.halt_reason
+    assert "EtherCAT" in sup.halt_reason          # detail 그대로 노출
+    snap = sup.snapshot()
+    assert snap["last_rejection"]["code"] == 6
+    assert snap["last_rejection"]["category"] == "hardware"
+    calls = hal.play_call_count
+    run_ticks(hal, sup, 4)                        # HALT — 재시도 없음
+    assert hal.play_call_count == calls
+
+
+def test_unknown_rejection_code_is_fatal_halt():
+    """분류표에 없는 코드(예: 9)는 fatal — 조용히 id 제외로 오분류하지 않고
+    HALT한다 (요청/상태 문제는 detail을 사람에게 보여야 한다)."""
+    hal, cache, sup, plan, _ = build_world()
+    hal.set_rejection(9, detail="요청 상태가 올바르지 않습니다.")
+    run_ticks(hal, sup, 4)
+    assert sup.state == SupervisorState.HALTED
+    assert "fatal" in sup.halt_reason
+    # permanent 경로(후보 제외)를 타지 않았다
+    assert 1 in sup.selector.loaded
+
+
 def test_code_4_rejection_excludes_id_permanently():
     hal, cache, sup, plan, _ = build_world()
     # 카탈로그에는 있지만 적재가 빠진 상황을 재현: HAL에서 슬롯 제거
@@ -81,8 +111,8 @@ def test_boundary_via_handle_completion():
     assert any("play done" in e.text for e in cache.events())
 
 
-def test_boundary_fallback_via_is_busy_when_handle_lost():
-    """핸들 유실 시 is_busy 폴백으로 경계를 잡고 계속 간다.
+def test_boundary_fallback_via_busy_state_when_handle_lost():
+    """핸들 유실 시 busy_state()=="idle" 폴백으로 경계를 잡고 계속 간다.
 
     폴백 경계는 완료를 어느 모션에 귀속시킬 수 없으므로(핸들이 곧 귀속 증거)
     plan은 전진하지 않는다 — 다음 선곡이 같은 단계를 다시 시도한다.
@@ -92,10 +122,29 @@ def test_boundary_fallback_via_is_busy_when_handle_lost():
     assert sup.state == SupervisorState.PLAYING
     sup._handle = None                            # 핸들 유실 시뮬레이션
     run_ticks(hal, sup, 3)
-    assert any("is_busy() fallback" in e.text for e in cache.events())
+    assert any("busy_state fallback" in e.text for e in cache.events())
     plays = sum(1 for e in cache.events() if e.text.startswith("play: motion"))
     assert plays >= 2                             # 멈추지 않고 재선곡했다
     run_ticks(hal, sup, 14)                       # 이후 정상 완주
+    assert plan.done
+
+
+def test_boundary_fallback_unknown_holds_no_play():
+    """폴백 상태가 "unknown"이면 경계 판단을 **보류**한다 — idle을 추측해
+    play를 내보내지 않는다 (문서: STALE/CONTRACT_INACTIVE/UNKNOWN은 모름)."""
+    hal, cache, sup, plan, _ = build_world()
+    run_ticks(hal, sup, 2)                        # 재생 시작
+    assert sup.state == SupervisorState.PLAYING
+    sup._handle = None                            # 핸들 유실
+    hal.busy_state = lambda: "unknown"            # 실물 STALE 상황 모사
+    calls = hal.play_call_count
+    run_ticks(hal, sup, 5)
+    assert sup.state == SupervisorState.PLAYING   # 보류 — 전이 없음
+    assert hal.play_call_count == calls           # 새 play 없음
+    assert any("busy_state unknown" in e.text for e in cache.events())
+
+    del hal.busy_state                            # 상태 조회 회복 → 재개
+    run_ticks(hal, sup, 16)
     assert plan.done
 
 

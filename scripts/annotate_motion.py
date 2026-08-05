@@ -38,11 +38,12 @@ def make_hal(mock: bool):
             s = 10 * s**3 - 15 * s**4 + 6 * s**5
             return home + s * (pose - home)
         return MockPhorceHAL({1: MockMotion(1.0, traj)})
-    # TODO(현장): phorce 파사드 래퍼로 교체
-    #   from robot_core.hal.phorce_real import RealPhorceHAL
-    #   return RealPhorceHAL(phorce.connect())
-    raise SystemExit("실물 HAL 미구현 — 현장에서 RealPhorceHAL 연결 후 사용. "
-                     "목 리허설은 --mock")
+    # 실물: 파사드 연결 + 피드백 브리지 (시동 절차는 README 캠프 섹션)
+    from robot_core.adapters.phorce_ros2 import PhorceFeedbackBridge
+    from robot_core.hal.real_phorce import RealPhorceHAL
+    hal = RealPhorceHAL()
+    hal.attach_feedback_bridge(PhorceFeedbackBridge())
+    return hal
 
 
 def main() -> None:

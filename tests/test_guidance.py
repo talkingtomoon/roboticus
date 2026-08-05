@@ -106,6 +106,46 @@ def test_single_incomplete_not_shown_repeated_is():
     assert repeated["severity"] == "action"
 
 
+def test_facade_detail_shown_verbatim_when_present():
+    """파사드 MotionRejected.detail(한국어)은 **그대로 노출** — 번역표
+    detail은 폴백. 절차 steps는 우리 것이 더 구체적이므로 유지."""
+    g = compute_guidance(
+        snap("WAITING_OPERATOR",
+             last_rejection={"code": 12, "category": "operator",
+                             "detail": "영점 조정이 필요합니다. 1번 버튼을 누르세요."}),
+        ev("operator required (code 12) — WAITING_OPERATOR"))
+    assert g["detail"] == "영점 조정이 필요합니다. 1번 버튼을 누르세요."
+    assert g["steps"] == REJECTION_STEPS[12]["steps"]     # 절차는 번역표 유지
+
+    # detail 없으면 번역표 폴백
+    g2 = compute_guidance(snap("WAITING_OPERATOR"),
+                          ev("operator required (code 12)"))
+    assert g2["detail"] == REJECTION_STEPS[12]["detail"]
+
+
+def test_hardware_rejection_halt_translation():
+    g = compute_guidance(
+        snap("HALTED",
+             halt_reason="play rejected code 6 (hardware): EtherCAT 끊김",
+             last_rejection={"code": 6, "category": "hardware",
+                             "detail": "EtherCAT 통신이 끊겼습니다."}),
+        [])
+    assert "거절" in g["headline"]
+    assert g["detail"] == "EtherCAT 통신이 끊겼습니다."   # detail 그대로
+    assert any("터미널1" in s or "phorce_monitor" in s for s in g["steps"])
+    assert g["severity"] == "danger"
+
+
+def test_error_17_after_button_recovery_is_info():
+    """알려진 현상: 버튼 복구 직후 첫 재생 error=17 중단 — 자동 재시도되니
+    info로만 안내한다 (사람이 할 일 없음)."""
+    g = compute_guidance(snap("DECIDING"), ev(
+        "play ABORTED: motion 3 aborted: CANCELED: error=17 — robot at arbitrary pose"))
+    assert "멈췄어요" in g["headline"]
+    assert "17" in g["detail"] and "기다려" in g["detail"]
+    assert g["severity"] == "info" and g["steps"] == []
+
+
 def test_unknown_state_fallback_shows_code():
     g = compute_guidance(snap("WOBBLING"), [])
     assert "운영 담당자" in g["headline"]

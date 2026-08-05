@@ -12,7 +12,9 @@
     계획 소진 + 보류 결정 없음 → DONE
 
 동작 경계 감지의 1차 수단은 play_async 핸들의 완료 이벤트다.
-is_busy() 폴링은 핸들 유실 시 폴백으로만 쓴다.
+핸들 유실 시 폴백은 hal.busy_state() — 실물에서는 robot.status().state_name
+이고, "IDLE"만 유휴의 증거다. "unknown"(STALE 등)이면 판단을 **보류**한다
+(다른 신호로 idle을 추측하지 말 것 — 문서 명시. motion_slot_state 폴링 금지).
 
 BUSY(5) 원칙: 재생 중에는 play를 아예 부르지 않는다 (경계 확인 후에만 선곡).
 BUSY가 났다는 것 자체가 버그다 — busy_rejections 카운터로 계측하고
@@ -121,6 +123,8 @@ class Supervisor:
         self.busy_rejections = 0         # 재생 중 play 시도 (0이어야 정상)
         self.no_candidate_ticks = 0
         self.last_arrival: dict | None = None   # 직전 재생의 도달 판정 (뷰용)
+        self.last_rejection: dict | None = None  # 직전 거절 (guidance가 detail 노출)
+        self._busy_unknown_marked = False
         self._dob_peak: tuple | None = None     # (peak, axis) — _observe가 갱신
         self._thread: threading.Thread | None = None
         self._stop_evt = threading.Event()
@@ -242,6 +246,7 @@ class Supervisor:
                                 "source": pending.source}),
             "hold_rest": self._hold_rest,
             "last_arrival": self.last_arrival,
+            "last_rejection": self.last_rejection,
             "busy_rejections": self.busy_rejections,
             "breaker": {f"{k[0]}:ax{k[1]}": len(v)
                         for k, v in self._fail_times.items() if v},
@@ -280,6 +285,16 @@ class Supervisor:
             problems.append("E-stop이 눌린 상태다 — 해제 후 시작할 것")
         if status.get("ethercat_operational") is False:
             problems.append("EtherCAT이 동작 중이 아니다 — 버스/전원 확인")
+
+        # robot.doctor() 자가진단 — 실물 HAL만 제공한다 (목은 건너뜀)
+        if hasattr(self.hal, "doctor"):
+            try:
+                d = self.hal.doctor() or {}
+                if d.get("ok") is False:
+                    for issue in d.get("issues") or ["doctor: 원인 미상 실패"]:
+                        problems.append(f"doctor: {issue}")
+            except Exception as e:
+                problems.append(f"doctor() 조회 실패: {type(e).__name__}: {e}")
 
         # 피드백 침묵 검사 (QoS 실수의 전형적 증상 — 에러 없이 0개 수신)
         first = self.cache.latest()
@@ -501,12 +516,20 @@ class Supervisor:
                 self.state = SupervisorState.DECIDING
             return True
 
-        # 핸들 유실 폴백: is_busy 폴링
-        if not self.hal.is_busy():
-            self.cache.mark_event("boundary via is_busy() fallback (handle lost)")
+        # 핸들 유실 폴백: busy_state() — "idle"만 경계의 증거다.
+        # "unknown"(STALE/CONTRACT_INACTIVE/UNKNOWN)은 모른다는 뜻이므로
+        # 보류하고 다음 틱에 다시 본다 (추측으로 play를 내보내는 게 최악).
+        bs = self.hal.busy_state()
+        if bs == "idle":
+            self._busy_unknown_marked = False
+            self.cache.mark_event("boundary via busy_state fallback (handle lost)")
             self._current_meta = None
             self.state = SupervisorState.DECIDING
             return True
+        if bs == "unknown" and not self._busy_unknown_marked:
+            self._busy_unknown_marked = True    # 틱마다 도배하지 않게 1회만
+            self.cache.mark_event(
+                "busy_state unknown (handle lost) — 경계 판단 보류")
         return False
 
     def _assess_arrival(self, motion_id: int) -> dict:
@@ -574,9 +597,12 @@ class Supervisor:
             return
 
         # BUSY 원칙: 여기 도달했다는 건 경계 확인이 끝났다는 뜻.
-        # 그래도 방어적으로 is_busy를 마지막에 본다 (폭주 금지의 이중 방어).
-        if self.hal.is_busy():
-            self.cache.mark_event("still busy at decide time — skip (no play call)")
+        # 그래도 방어적으로 상태를 마지막에 본다 (폭주 금지의 이중 방어).
+        # "unknown"도 skip — 모르는 채로 play를 내보내지 않는다.
+        bs = self.hal.busy_state()
+        if bs != "idle":
+            self.cache.mark_event(
+                f"busy_state={bs} at decide time — skip (no play call)")
             self._restore_pending(taken)
             return
 
@@ -588,20 +614,31 @@ class Supervisor:
             self._restore_pending(taken)
             return
         except MotionRejected as e:
+            detail = getattr(e, "detail", "")
+            self.last_rejection = {"code": e.code,
+                                   "category": getattr(e, "category", "fatal"),
+                                   "detail": detail}
             if e.needs_operator:
                 self.state = SupervisorState.WAITING_OPERATOR
                 self.cache.mark_event(
                     f"operator required (code {e.code}) — WAITING_OPERATOR, "
-                    f"자동 재시도 안 함")
+                    f"자동 재시도 안 함"
+                    + (f" | detail: {detail}" if detail else ""))
                 print(f"** 사람 개입 필요: 거절 코드 {e.code} "
                       f"({'영점 버튼' if e.code == 12 else '복구 절차'}) — "
                       f"완료 후 operator_cleared() 호출")
-            else:
+            elif getattr(e, "category", None) == "permanent":
                 # 3/4: 이 id는 앞으로도 안 된다 — 후보에서 영구 제외
                 self.selector.loaded.discard(report.best_id)
                 self.cache.mark_event(
                     f"motion {report.best_id} rejected (code {e.code}) — "
                     f"excluded from candidates")
+            else:
+                # hardware(6/11)/fatal(그 외): id 문제가 아니다 — 재선곡으로
+                # 풀리지 않으니 멈추고 파사드 detail을 사람에게 보인다
+                self.halt(f"play rejected code {e.code} "
+                          f"({getattr(e, 'category', 'fatal')})"
+                          + (f": {detail}" if detail else ""))
             self._restore_pending(taken)
             return
 

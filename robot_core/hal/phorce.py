@@ -13,9 +13,9 @@
 핵심 규칙: 1kHz 콜백에서는 최신 상태 저장만. 판단·전송은 느린 루프(~2Hz).
 이 규칙은 supervisor.FeedbackCache / DecisionLoop 구조가 강제한다.
 
-실물 연결(캠프 현장): phorce 파이썬 파사드(phorce.connect())를 이 인터페이스로
-감싸는 RealPhorceHAL을 작성한다 — scripts/field_smoke.py가 파사드 가정을
-하나씩 검증해 주므로, 깨지는 가정만 고치면 된다.
+실물 연결(캠프 현장): RealPhorceHAL(hal/real_phorce.py)이 파사드를 이
+인터페이스로 감싼다 (문서 확정 API 기준 구현 완료). scripts/field_smoke.py가
+현장에서 가정을 하나씩 실측한다 — 깨지는 항목만 그 코드 위치에서 고친다.
 """
 
 from __future__ import annotations
@@ -30,6 +30,8 @@ from robot_core.hal.mock import MockRobotHAL
 
 N_AXES = 12
 MOTION_ID_MIN, MOTION_ID_MAX = 1, 50
+NO_MOTION = 0                # play(0) 금지 — "모션 없음" 센티널이지 명령이 아니다
+MAX_SEQUENCE_LENGTH = 1      # 한 요청에 id 하나만 (문서 확정 — 시퀀스 전송 금지)
 
 # 거절 코드 (매뉴얼 정본)
 REJECT_OUT_OF_RANGE = 3
@@ -38,6 +40,28 @@ REJECT_BUSY = 5
 REJECT_NOT_READY = 12        # 사람이 영점 버튼을 눌러야 함
 REJECT_RECOVERY_REQUIRED = 13  # 사람이 복구 절차를 밟아야 함
 OPERATOR_CODES = (REJECT_NOT_READY, REJECT_RECOVERY_REQUIRED)
+
+# 거절코드 → 우리 대응 분류 (문서 확정. **숫자로 비교한다** — REJECT_* 문자열
+# 이름은 파사드 버전에 따라 흔들릴 수 있으나 코드 번호는 프로토콜이다)
+#   busy      : 다음 판단 틱에 자연 재시도 (즉시 재시도 루프 금지)
+#   operator  : 사람 개입 전까지 어떤 play도 안 된다 — WAITING_OPERATOR
+#   permanent : 그 id가 문제 (범위 밖/미적재) — 해당 id 영구 제외
+#   hardware  : EtherCAT/축 문제 — id를 바꿔도 소용없다 → HALTED
+#   fatal     : 요청/상태 문제 — detail을 사람에게 보여주고 HALTED
+_REJECT_CATEGORY = {
+    REJECT_BUSY: "busy",
+    REJECT_NOT_READY: "operator",
+    REJECT_RECOVERY_REQUIRED: "operator",
+    REJECT_OUT_OF_RANGE: "permanent",
+    REJECT_NOT_LOADED: "permanent",
+    6: "hardware",
+    11: "hardware",
+}
+
+
+def classify_reject_code(code: int) -> str:
+    """미지 코드는 'fatal' — 조용히 넘기지 않고 사람에게 보인다."""
+    return _REJECT_CATEGORY.get(int(code), "fatal")
 
 
 # ------------------------------------------------------------------ 예외 계층
@@ -49,24 +73,33 @@ class MotionBusy(PhorceError):
     """코드 5: 재생 중. 유일하게 '나중에 재시도'가 올바른 대응인 거절.
 
     단, 느린 루프 규칙상 재시도는 다음 판단 틱에서 — 즉시 재시도 루프 금지
-    (BUSY 폭주). 애초에 is_busy()/핸들 완료 확인 후에만 play해야 한다.
+    (BUSY 폭주). 애초에 핸들 완료(폴백: busy_state()=="idle") 확인 후에만
+    play해야 한다.
     """
 
     code = REJECT_BUSY
 
 
 class MotionRejected(PhorceError):
-    """코드 3/4/12/13: 재시도해도 소용없는 거절.
+    """BUSY(5) 외의 모든 거절. 재시도해도 소용없다 — 분류(category)별 대응:
 
-    needs_operator=True (12/13)면 사람 개입 전까지 어떤 play도 성공하지 않는다
-    — 자동 재시도 금지, WAITING_OPERATOR 상태로 전환하고 콘솔 경고.
+    - needs_operator=True (12/13): 사람 개입 전까지 어떤 play도 성공하지
+      않는다 — 자동 재시도 금지, WAITING_OPERATOR 전환 + 콘솔 경고
+    - "permanent" (3/4): 그 id만 문제 — 후보에서 영구 제외
+    - "hardware" (6/11) / "fatal" (그 외): id를 바꿔도 소용없다 — HALTED
+
+    detail: 파사드가 주는 한국어 안내문. 운용자 페이지에 **그대로 노출**한다
+    (우리 번역표는 detail이 없을 때의 폴백).
     """
 
-    def __init__(self, code: int, message: str = "") -> None:
+    def __init__(self, code: int, message: str = "", detail: str = "") -> None:
         self.code = int(code)
-        self.needs_operator = self.code in OPERATOR_CODES
+        self.category = classify_reject_code(self.code)
+        self.needs_operator = self.category == "operator"
+        self.detail = str(detail or "")
         super().__init__(f"rejected code={self.code}"
                          + (f" ({message})" if message else "")
+                         + (f" — {self.detail}" if self.detail else "")
                          + (" [사람 개입 필요]" if self.needs_operator else ""))
 
 
@@ -115,7 +148,7 @@ class PhorceFeedback:
 
 class PlayHandle:
     """play_async 결과 핸들. 완료 이벤트가 경계 감지의 1차 수단이다
-    (is_busy 폴링은 핸들 유실 시 폴백)."""
+    (핸들 유실 시 폴백은 busy_state() — motion_slot_state 폴링 금지)."""
 
     def __init__(self, motion_id: int) -> None:
         self.motion_id = int(motion_id)
@@ -154,7 +187,8 @@ class PhorceHAL:
     - latest_feedback(): 논블로킹, 마지막 수신 프레임 (없으면 None)
     - play(id): 블로킹 재생. MotionBusy/MotionRejected/MotionAborted
     - play_async(id): PlayHandle 반환 (완료 이벤트 = 경계 감지 1차 수단)
-    - is_busy(): 재생 중인가
+    - busy_state(): "busy" | "idle" | "unknown" — 핸들 유실 시 폴백.
+      "unknown"이면 판단을 보류한다 (idle을 다른 신호로 추측하지 말 것)
     - catalog(): 적재 슬롯 정본 {id: duration_s} (robot.motions() 대응)
     """
 
@@ -169,6 +203,17 @@ class PhorceHAL:
 
     def is_busy(self) -> bool:
         raise NotImplementedError
+
+    def busy_state(self) -> str:
+        """"busy" | "idle" | "unknown". 기본 구현은 is_busy() 이진 매핑 (목).
+
+        실물은 robot.status().state_name으로 구현한다 — "IDLE"만 유휴의
+        증거이고, STALE/CONTRACT_INACTIVE/UNKNOWN이면 "unknown"을 돌려
+        판단을 보류시킨다 (문서: 다른 필드로 idle을 추측하지 말 것).
+        motion_slot_state 폴링 금지 — 이 메서드는 폴백일 뿐, 경계 감지의
+        1차 수단은 언제나 play_async 핸들 완료다.
+        """
+        return "busy" if self.is_busy() else "idle"
 
     def catalog(self) -> dict[int, float]:
         raise NotImplementedError
@@ -224,7 +269,7 @@ class MockPhorceHAL(PhorceHAL):
         # 열 모델은 실물 스케일로 보수적으로: 12A(잼 극단)에서도 ~2°C/s.
         # 목적은 열 예측이 아니라 "시나리오가 의도한 것만 테스트하게" —
         # 과장된 계수는 막힘 시나리오에 과열을 끼워 넣어 리허설을 오염시킨다.
-        # 실물 계수는 scripts/field_smoke.py A6 분포를 보고 조정.
+        # 실물 계수는 scripts/field_smoke.py A5 분포를 보고 조정.
         heat_k: float = 0.015,     # dT/dt += heat_k * current^2
         cool_k: float = 0.08,      # dT/dt -= cool_k * (T - ambient)
         dynamics_kwargs: dict | None = None,
@@ -251,6 +296,7 @@ class MockPhorceHAL(PhorceHAL):
         self._hold_q = self._dyn.read_state().q.copy()
 
         self._rejection_code: int | None = None
+        self._rejection_detail = ""
         self._seq = 0
         self._latest: PhorceFeedback | None = None
         self._callbacks: list = []
@@ -280,15 +326,20 @@ class MockPhorceHAL(PhorceHAL):
     def clear_jam(self, axis: int | None = None) -> None:
         self._dyn.clear_jam(axis)
 
-    def set_rejection(self, code: int) -> None:
-        """다음 play부터 이 코드로 거절 (clear_rejection까지 지속)."""
-        if code not in (REJECT_NOT_READY, REJECT_RECOVERY_REQUIRED,
-                        REJECT_OUT_OF_RANGE, REJECT_NOT_LOADED):
-            raise ValueError(f"주입 가능한 거절 코드가 아님: {code}")
+    def set_rejection(self, code: int, detail: str = "") -> None:
+        """다음 play부터 이 코드로 거절 (clear_rejection까지 지속).
+
+        detail: 파사드 MotionRejected.detail(한국어 안내) 모사 —
+        운용자 페이지 그대로-노출 경로 테스트용.
+        """
+        if code == REJECT_BUSY:
+            raise ValueError("BUSY(5)는 주입이 아니라 재생 중 play로 재현할 것")
         self._rejection_code = int(code)
+        self._rejection_detail = str(detail or "")
 
     def clear_rejection(self) -> None:
         self._rejection_code = None
+        self._rejection_detail = ""
 
     def set_temperature(self, axis: int, temp_c: float) -> None:
         self.temp_c[axis] = float(temp_c)
@@ -350,7 +401,8 @@ class MockPhorceHAL(PhorceHAL):
         if self._playing is not None:
             raise MotionBusy(f"motion {self._playing} still playing")
         if self._rejection_code is not None:
-            raise MotionRejected(self._rejection_code)
+            raise MotionRejected(self._rejection_code,
+                                 detail=self._rejection_detail)
         if not (MOTION_ID_MIN <= motion_id <= MOTION_ID_MAX):
             raise MotionRejected(REJECT_OUT_OF_RANGE, f"id {motion_id}")
         if motion_id not in self._loaded or motion_id not in self._catalog:

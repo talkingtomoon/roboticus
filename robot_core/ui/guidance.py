@@ -89,6 +89,20 @@ def compute_guidance(snapshot: dict, events: list) -> dict:
                 out["detail"] = "로봇 주변에 걸리는 물건이 있는지 확인해 주세요."
                 out["steps"] = ["로봇 주변에 걸리는 물건이 있는지 확인하세요.",
                                 "확인 후 [재개]를 누르세요."]
+        elif "play rejected code" in reason:
+            # hardware(6/11)/fatal 거절 — 파사드 detail(한국어)을 그대로 노출
+            out["headline"] = "로봇이 동작 요청을 거절해서 멈췄어요."
+            rej = snapshot.get("last_rejection") or {}
+            out["detail"] = rej.get("detail") or reason
+            if rej.get("category") == "hardware":
+                out["steps"] = ["젯슨과 로봇 사이 케이블/전원을 확인하세요.",
+                                "로봇을 껐다 켰다면 터미널1(phorce_monitor)도 "
+                                "재실행해야 해요.",
+                                "해결되면 [재개]를, 모르겠으면 운영 담당자를 "
+                                "불러주세요."]
+            else:
+                out["steps"] = ["운영 담당자를 불러주세요."]
+            out["code"] = rej.get("code")
         elif any(w in reason for w in ("voice", "web UI", "정지 버튼",
                                        "멈춰 버튼", "operator halt")):
             out["detail"] = "사람이 정지시켰어요. 준비되면 [재개]를 누르세요."
@@ -112,6 +126,12 @@ def compute_guidance(snapshot: dict, events: list) -> dict:
         if code is not None and code not in REJECTION_STEPS:
             out["detail"] = f"알 수 없는 거절 코드예요 (코드 {code})."
             out["code"] = code
+        # 파사드 MotionRejected.detail은 한국어 안내문 — 있으면 **그대로
+        # 노출**한다 (우리 번역표 detail은 그것이 없을 때의 폴백. 절차
+        # steps는 우리 것이 더 구체적이므로 유지)
+        rej = snapshot.get("last_rejection") or {}
+        if rej.get("detail") and rej.get("code") == code:
+            out["detail"] = rej["detail"]
         return out
 
     # ---------------- preflight/E-stop/파사드 (이벤트 기반) ----------------
@@ -132,6 +152,16 @@ def compute_guidance(snapshot: dict, events: list) -> dict:
         else:
             out["detail"] = pf.replace("preflight FAILED: ", "")
             out["steps"] = ["운영 담당자를 불러주세요."]
+        return out
+
+    # ---------------- 알려진 현상: 버튼 복구 직후 error=17 ----------------
+    # 첫 재생이 error=17로 중단될 수 있다 — 한 번 더 보내면 된다 (매뉴얼).
+    # 시스템이 알아서 재선곡하므로 사람은 기다리기만 하면 된다 (info).
+    aborted = _recent(events, "play ABORTED", n=15)
+    if aborted and re.search(r"(?:error|code)\s*=?\s*17\b", aborted):
+        out["headline"] = "방금 동작이 시작하자마자 멈췄어요."
+        out["detail"] = ("버튼으로 복구한 직후에 흔히 생기는 현상이에요 "
+                         "(코드 17). 곧 자동으로 다시 시도하니 기다려 주세요.")
         return out
 
     # ---------------- 정상 상태들 ----------------

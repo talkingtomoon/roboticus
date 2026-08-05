@@ -1,19 +1,24 @@
-"""현장 호환성 스모크 — 캠프 1일차에 sim:demo 대상으로 파사드 가정을 검증.
+"""현장 스모크 — 실물 전용, 안전 우선. 시뮬레이터는 없다 (문서 확정).
 
-우리 코드는 phorce 파사드에 대한 가정 위에 서 있다. 이 스크립트는 가정을
-하나씩 실측해 PASS/FAIL/실측치를 한 장 리포트로 만든다. 깨지는 가정이 있으면
-리포트에 적힌 코드 위치만 고치면 된다.
+기본 실행(A1~A5)은 전부 **읽기**다 — 로봇이 움직이지 않는다.
+A6(쓰기: 모션 1개 재생)은 --allow-motion 플래그와 대화형 확인이 **둘 다**
+있어야 실행된다.
 
-    python scripts/field_smoke.py --mock            # 목으로 리포트 형식 리허설
-    python scripts/field_smoke.py                    # 현장: RealPhorceHAL 연결 후
+    python scripts/field_smoke.py                     # A1~A5 읽기 전용
+    python scripts/field_smoke.py --allow-motion 4    # + A6 (로봇이 움직인다!)
 
-검증 항목:
-  A1 connect/status/motions 왕복
-  A2 watch() 콜백 실측 주파수 + 호출 스레드 식별 (10초 측정)
-  A3 play 완료 → 핸들 이벤트 지연 실측
-  A4 재생 중 play 시도 → MotionBusy 발생 확인
-  A5 12축 중 valid 축 인덱스
-  A6 dob_a/current_a 30초 분포 → 감지 임계 자동 제안
+검증 순서 (고정):
+  A1 [읽기] phorce.connect() 성공 (PhorceUnavailable 처리)
+  A2 [읽기] robot.doctor() → ok/issues
+  A3 [읽기] robot.status() → state_name, 2초 간격 3회
+  A4 [읽기] robot.motions() → 적재 id 목록 (카탈로그 정본)
+  A5 [읽기] 피드백 30초 수집 → 실측 Hz, valid 축 인덱스,
+            dob_a/current_a 분포 → 감지 임계 자동 제안, temp_c 기준선
+  A6 [쓰기] ★사람 확인 후에만★ 지정 안전 모션 1개 재생 →
+            핸들 완료 지연 실측, result.ok/detail 확인
+
+각 항목은 PASS/FAIL/실측치와 함께, 실패 시 그 가정이 박혀 있는 코드
+위치를 리포트에 명시한다 — 깨진 가정만 그 자리에서 고치면 된다.
 """
 
 from __future__ import annotations
@@ -21,7 +26,6 @@ from __future__ import annotations
 import argparse
 import statistics
 import sys
-import threading
 import time
 from pathlib import Path
 
@@ -29,7 +33,10 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from robot_core.hal.phorce import MotionBusy, N_AXES  # noqa: E402
+from robot_core.hal.phorce import (  # noqa: E402
+    MotionAborted, PhorceError,
+)
+from robot_core.hal.real_phorce import RealPhorceHAL  # noqa: E402
 
 
 class Report:
@@ -41,7 +48,7 @@ class Report:
         print(f"  [{status}] {item}: {measured}")
 
     def render(self) -> str:
-        lines = ["=" * 78, "PHORCE 현장 호환성 스모크 리포트", "=" * 78,
+        lines = ["=" * 78, "PHORCE 현장 스모크 리포트 (실물)", "=" * 78,
                  f"{'항목':30s} {'판정':6s} 실측치 / 가정 코드 위치", "-" * 78]
         for item, status, measured, loc in self.rows:
             lines.append(f"{item:30s} {status:6s} {measured}")
@@ -49,160 +56,206 @@ class Report:
         n_fail = sum(1 for r in self.rows if r[1] == "FAIL")
         lines.append("-" * 78)
         lines.append(f"결과: {len(self.rows) - n_fail}/{len(self.rows)} PASS"
-                     + ("" if n_fail == 0 else f"  ** FAIL {n_fail}건 — 위 코드 위치 수정"))
+                     + ("" if n_fail == 0 else
+                        f"  ** FAIL {n_fail}건 — 위 코드 위치 수정"))
         lines.append("=" * 78)
         return "\n".join(lines)
 
 
-def make_hal(mock: bool, sim_thread=None):
-    if mock:
-        from robot_core.hal.phorce import MockMotion, MockPhorceHAL
-        home = np.zeros(N_AXES)
-        pose = np.zeros(N_AXES); pose[:3] = [0.4, -0.2, 0.5]
-
-        def traj(t):
-            s = min(t / 1.0, 1.0)
-            s = 10 * s**3 - 15 * s**4 + 6 * s**5
-            return home + s * (pose - home)
-        hal = MockPhorceHAL({1: MockMotion(1.0, traj),
-                             2: MockMotion(0.8, lambda t: pose)})
-        # 목에는 수신 스레드가 없으므로 하나 돌려서 실물 조건을 흉내낸다
-        stop = threading.Event()
-
-        def sim():
-            while not stop.is_set():
-                hal.step(1)
-                time.sleep(0.001)
-        th = threading.Thread(target=sim, daemon=True, name="mock-feedback")
-        th.start()
-        hal._smoke_stop = stop
+def stage_a1_connect(rep: Report) -> RealPhorceHAL | None:
+    try:
+        hal = RealPhorceHAL()
+        rep.add("A1 phorce.connect()", "PASS", "연결됨",
+                "hal/real_phorce.py _connect_facade()")
         return hal
-    # TODO(현장): phorce 파사드 래퍼
-    #   import phorce; robot = phorce.connect()
-    #   from robot_core.hal.phorce_real import RealPhorceHAL
-    #   return RealPhorceHAL(robot)
-    raise SystemExit("실물 HAL 미구현 — RealPhorceHAL 연결 후 사용. "
-                     "리포트 형식 확인은 --mock")
+    except PhorceError as e:
+        rep.add("A1 phorce.connect()", "FAIL", str(e).splitlines()[0],
+                "hal/real_phorce.py _connect_facade() — 시동 절차(README) 확인")
+        return None
+
+
+def stage_a2_doctor(rep: Report, hal: RealPhorceHAL) -> None:
+    try:
+        d = hal.doctor()
+        status = "PASS" if d["ok"] else "FAIL"
+        issues = "; ".join(d["issues"]) if d["issues"] else "(이슈 없음)"
+        rep.add("A2 robot.doctor()", status, f"ok={d['ok']} {issues}",
+                "hal/real_phorce.py RealPhorceHAL.doctor() / supervisor.preflight")
+    except Exception as e:
+        rep.add("A2 robot.doctor()", "FAIL", f"{type(e).__name__}: {e}",
+                "hal/real_phorce.py RealPhorceHAL.doctor()")
+
+
+def stage_a3_status(rep: Report, hal: RealPhorceHAL) -> None:
+    names = []
+    for i in range(3):
+        st = hal.status()
+        names.append(st.get("state_name", st.get("error", "?")))
+        if i < 2:
+            time.sleep(2.0)
+    ok = all("error" not in str(n).lower() for n in names)
+    rep.add("A3 robot.status() x3 (2s 간격)", "PASS" if ok else "FAIL",
+            f"state_name={names} — 'IDLE'만 유휴의 증거 "
+            f"(STALE/CONTRACT_INACTIVE/UNKNOWN은 '모름')",
+            "hal/real_phorce.py busy_state() / supervisor._check_boundary 폴백")
+
+
+def stage_a4_motions(rep: Report, hal: RealPhorceHAL) -> dict[int, str]:
+    try:
+        names = hal.motion_names()
+        ok = bool(names)
+        listing = ", ".join(f"{i}:{n}" for i, n in sorted(names.items()))
+        rep.add("A4 robot.motions()", "PASS" if ok else "FAIL",
+                f"적재 {len(names)}개 [{listing}]" if ok else
+                "적재 모션 0개 — SD 카드/교시 확인",
+                "hal/real_phorce.py catalog() / catalog.reconcile (id만 대조)")
+        return names
+    except Exception as e:
+        rep.add("A4 robot.motions()", "FAIL", f"{type(e).__name__}: {e}",
+                "hal/real_phorce.py catalog()")
+        return {}
+
+
+def stage_a5_feedback(rep: Report, hal: RealPhorceHAL, seconds: float) -> None:
+    try:
+        from robot_core.adapters.phorce_ros2 import PhorceFeedbackBridge
+        bridge = PhorceFeedbackBridge()
+    except Exception as e:
+        rep.add("A5 피드백 수집", "FAIL", f"브리지 생성 실패: {e}",
+                "adapters/phorce_ros2.py PhorceFeedbackBridge")
+        return
+
+    frames_t, dobs, curs = [], [], []
+    last = {"frame": None}
+
+    def collect(frame):
+        frames_t.append(frame.t)
+        u = frame.usable
+        dobs.append(float(np.where(u, np.abs(frame.dob_a), 0.0).max()))
+        curs.append(float(np.where(u, np.abs(frame.current_a), 0.0).max()))
+        last["frame"] = frame
+
+    try:
+        hal.watch(collect)
+        hal.attach_feedback_bridge(bridge)
+    except RuntimeError as e:
+        rep.add("A5 피드백 수집", "FAIL", str(e),
+                "adapters/phorce_ros2.py start() — rclpy/agx_msgs source 확인")
+        return
+    print(f"  ... 피드백 {seconds:.0f}초 수집 중 (로봇은 움직이지 않음)")
+    time.sleep(seconds)
+    bridge.stop()
+
+    if len(frames_t) < 100:
+        rep.add("A5 피드백 수집", "FAIL",
+                f"{len(frames_t)}프레임뿐 ({seconds:.0f}s) — "
+                "qos_profile_sensor_data 미적용이면 에러 없이 0건이 된다",
+                "adapters/phorce_ros2.py start() QoS")
+        return
+
+    hz = 1.0 / float(np.median(np.diff(frames_t)))
+    fb = last["frame"]
+    valid_idx = [int(i) for i in np.flatnonzero(fb.usable)]
+    temps = ", ".join(f"ax{i}:{fb.temp_c[i]:.1f}" for i in valid_idx)
+    dob_p99 = float(np.percentile(dobs, 99))
+    cur_p99 = float(np.percentile(curs, 99))
+    rep.add("A5 피드백 실측", "PASS" if hz > 500 else "WARN",
+            f"{hz:.0f} Hz (median), {len(frames_t)}프레임, "
+            f"valid {len(valid_idx)}/12: {valid_idx}",
+            "adapters/phorce_ros2.py msg_to_frame (recv_monotonic_ns 시간축)")
+    rep.add("A5 감지 임계 제안", "PASS",
+            f"|dob| p50={statistics.median(dobs):.2f} p99={dob_p99:.2f} A, "
+            f"|cur| p99={cur_p99:.2f} A → impact_dob_threshold="
+            f"{max(dob_p99 * 3, 1.0):.1f}, "
+            f"stall_current_floor={max(cur_p99 * 0.5, 0.5):.1f}",
+            "recovery/detector.py DetectorConfig")
+    rep.add("A5 온도 기준선", "PASS", temps or "(valid 축 없음)",
+            "recovery/detector.py 과열 임계 대비 기준선")
+
+
+def stage_a6_play(rep: Report, hal: RealPhorceHAL, motion_id: int,
+                  names: dict[int, str]) -> None:
+    """유일한 쓰기 단계. --allow-motion + 대화형 확인 이중 게이트."""
+    name = names.get(motion_id, "?")
+    print(f"\n  ** A6는 로봇을 실제로 움직입니다: motion {motion_id} ({name})")
+    print("  ** 로봇 주변에 사람과 물건이 없는지 확인하세요.")
+    try:
+        answer = input("  계속하려면 'yes' 입력 (그 외 입력/Ctrl+C = 건너뜀): ")
+    except (EOFError, KeyboardInterrupt):
+        answer = ""
+    if answer.strip().lower() != "yes":
+        rep.add("A6 재생 (쓰기)", "SKIP", "사람 확인 없음 — 재생 안 함",
+                "scripts/field_smoke.py stage_a6_play (이중 게이트)")
+        return
+
+    t0 = time.perf_counter()
+    try:
+        handle = hal.play_async(motion_id)
+    except PhorceError as e:
+        rep.add("A6 재생 (쓰기)", "FAIL", f"{type(e).__name__}: {e}",
+                "hal/real_phorce.py play_async — 거절코드 분류표 "
+                "(hal/phorce.py classify_reject_code)")
+        return
+    handle.wait(timeout=120.0)
+    elapsed = time.perf_counter() - t0
+    if not handle.done():
+        rep.add("A6 재생 (쓰기)", "FAIL", f"{elapsed:.1f}s 지나도 핸들 미완료",
+                "hal/real_phorce.py _await_result (핸들 완료 = 경계 1차 수단)")
+        return
+    try:
+        handle.result()
+        rep.add("A6 재생 (쓰기)", "PASS",
+                f"완료까지 {elapsed:.2f}s, result ok",
+                "supervisor._check_boundary (핸들 완료 = 경계 감지 1차 수단)")
+    except MotionAborted as e:
+        # 알려진 현상: 버튼 복구 직후 첫 재생이 error=17로 중단될 수 있음 —
+        # 한 번 더 보내면 된다 (guidance.py에도 번역돼 있다)
+        rep.add("A6 재생 (쓰기)", "FAIL",
+                f"ABORTED after {elapsed:.2f}s: {e.reason} "
+                f"(error=17이면 한 번 더 보내면 된다 — 알려진 현상)",
+                "hal/real_phorce.py _await_result / ui/guidance.py error=17")
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--mock", action="store_true")
-    p.add_argument("--watch-sec", type=float, default=10.0)
-    p.add_argument("--dist-sec", type=float, default=30.0)
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--feedback-sec", type=float, default=30.0,
+                   help="A5 피드백 수집 시간 (기본 30초)")
+    p.add_argument("--allow-motion", type=int, default=None, metavar="ID",
+                   help="A6 활성화: 이 id의 안전 모션 1개를 재생한다 "
+                        "(대화형 확인도 통과해야 실행)")
     p.add_argument("--out", default="field_smoke_report.txt")
     args = p.parse_args()
 
     rep = Report()
-    hal = make_hal(args.mock)
+    hal = stage_a1_connect(rep)
+    if hal is None:
+        print("\n" + rep.render())
+        sys.exit(1)
 
-    # ---- A1: connect/status/motions 왕복 --------------------------------
-    try:
-        cat = hal.catalog()
-        fb = hal.latest_feedback()
-        ok = bool(cat) and fb is not None
-        rep.add("A1 connect/motions/feedback", "PASS" if ok else "FAIL",
-                f"적재 {len(cat)}개 slot={sorted(cat)}, feedback seq={getattr(fb, 'seq', None)}",
-                "hal/phorce.py PhorceHAL.catalog()/latest_feedback()")
-    except Exception as e:
-        rep.add("A1 connect/motions/feedback", "FAIL", f"{type(e).__name__}: {e}",
-                "hal/phorce.py PhorceHAL")
-        print(rep.render())
-        return
+    stage_a2_doctor(rep, hal)
+    stage_a3_status(rep, hal)
+    names = stage_a4_motions(rep, hal)
+    stage_a5_feedback(rep, hal, args.feedback_sec)
 
-    # ---- A2: watch() 실측 주파수 + 스레드 --------------------------------
-    stamps: list[float] = []
-    threads: set[str] = set()
-
-    def cb(frame):
-        stamps.append(time.perf_counter())
-        threads.add(threading.current_thread().name)
-
-    hal.watch(cb)
-    time.sleep(args.watch_sec if not args.mock else min(args.watch_sec, 3.0))
-    if len(stamps) >= 10:
-        periods = np.diff(stamps)
-        hz = 1.0 / float(np.median(periods))
-        status = "PASS" if hz > 200 else "WARN"
-        rep.add("A2 watch() 주파수/스레드", status,
-                f"{hz:.0f} Hz (median), 호출 스레드={sorted(threads)} — "
-                f"메인 스레드가 아니면 콜백은 저장만 (규칙 확인)",
-                "supervisor.py Supervisor.__init__ hal.watch(cache.push)")
+    if args.allow_motion is not None:
+        if args.allow_motion in names:
+            stage_a6_play(rep, hal, args.allow_motion, names)
+        else:
+            rep.add("A6 재생 (쓰기)", "FAIL",
+                    f"--allow-motion {args.allow_motion}은 적재 목록에 없다 "
+                    f"(적재: {sorted(names)})",
+                    "scripts/field_smoke.py — A4 적재 목록이 정본")
     else:
-        rep.add("A2 watch() 주파수/스레드", "FAIL", f"콜백 {len(stamps)}회뿐",
-                "hal/phorce.py PhorceHAL.watch")
-
-    # ---- A3: play 완료 → 핸들 이벤트 지연 --------------------------------
-    first_id = sorted(cat)[0]
-    dur = cat[first_id]
-    t0 = time.perf_counter()
-    h = hal.play_async(first_id)
-    if args.mock:
-        while not h.done():
-            time.sleep(0.005)
-    else:
-        h.wait(timeout=dur + 5.0)
-    latency = time.perf_counter() - t0 - dur
-    ok = h.done()
-    rep.add("A3 play 완료→핸들 지연", "PASS" if ok else "FAIL",
-            f"공칭 {dur:.2f}s, 핸들 완료까지 {time.perf_counter() - t0:.2f}s "
-            f"(지연 {latency * 1e3:+.0f} ms)",
-            "supervisor.py _check_boundary (핸들 완료 = 경계 감지 1차 수단)")
-
-    # ---- A4: 재생 중 play → MotionBusy ----------------------------------
-    h2 = hal.play_async(first_id)
-    try:
-        hal.play_async(first_id)
-        rep.add("A4 재생 중 play → BUSY", "FAIL", "예외 없이 통과 — 큐가 있나?",
-                "hal/phorce.py MotionBusy + supervisor.py BUSY 원칙")
-    except MotionBusy:
-        rep.add("A4 재생 중 play → BUSY", "PASS", "MotionBusy 발생 (매뉴얼 일치)",
-                "hal/phorce.py MotionBusy")
-    except Exception as e:
-        rep.add("A4 재생 중 play → BUSY", "FAIL", f"다른 예외: {type(e).__name__}: {e}",
-                "hal/phorce.py 예외 매핑")
-    if args.mock:
-        while not h2.done():
-            time.sleep(0.005)
-    else:
-        h2.wait(timeout=dur + 5.0)
-
-    # ---- A5: valid 축 인덱스 --------------------------------------------
-    fb = hal.latest_feedback()
-    valid_idx = [int(i) for i in np.flatnonzero(fb.usable)]
-    rep.add("A5 valid 축", "PASS" if valid_idx else "FAIL",
-            f"{len(valid_idx)}/12 valid: {valid_idx}",
-            "recovery/detector.py — valid=False 축은 판정 제외")
-
-    # ---- A6: dob/current 분포 → 임계 제안 --------------------------------
-    dobs, curs = [], []
-
-    def dist_cb(frame):
-        dobs.append(np.where(frame.usable, np.abs(frame.dob_a), 0.0).max())
-        curs.append(np.where(frame.usable, np.abs(frame.current_a), 0.0).max())
-
-    hal.watch(dist_cb)
-    time.sleep(args.dist_sec if not args.mock else min(args.dist_sec, 3.0))
-    if dobs:
-        dob_p99 = float(np.percentile(dobs, 99))
-        cur_p99 = float(np.percentile(curs, 99))
-        rep.add("A6 dob/current 분포", "PASS",
-                f"|dob| p50={statistics.median(dobs):.2f} p99={dob_p99:.2f} A, "
-                f"|cur| p99={cur_p99:.2f} A → 제안: impact_dob_threshold="
-                f"{max(dob_p99 * 3, 1.0):.1f}, stall_current_floor={max(cur_p99 * 0.5, 0.5):.1f}",
-                "recovery/detector.py DetectorConfig")
-    else:
-        rep.add("A6 dob/current 분포", "FAIL", "프레임 없음",
-                "hal/phorce.py watch")
-
-    if hasattr(hal, "_smoke_stop"):
-        hal._smoke_stop.set()
+        print("\n  (A6 건너뜀 — 재생하려면 --allow-motion <id>. 기본은 읽기 전용)")
 
     print()
     report_text = rep.render()
     print(report_text)
     Path(args.out).write_text(report_text, encoding="utf-8")
     print(f"\n저장: {args.out}")
+    if any(r[1] == "FAIL" for r in rep.rows):
+        sys.exit(1)
 
 
 if __name__ == "__main__":

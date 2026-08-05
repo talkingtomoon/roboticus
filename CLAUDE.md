@@ -28,5 +28,5 @@ README.md, 사람 작업 규칙은 CONTRIBUTING.md 참고.
 pytest -q                                      # 전체 (종료 조건)
 python examples/demo_full_rehearsal.py         # 리허설 5종
 python -m robot_core.ui.server --demo          # 웹 UI 데모 (:8710, /op 포함)
-python scripts/field_smoke.py --mock           # 현장 스모크 리허설
+python scripts/field_smoke.py                  # 현장 스모크 (실물 전용, 기본 읽기)
 ```
