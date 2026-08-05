@@ -6,11 +6,17 @@
   퍼블리셔(BEST_EFFORT)와 불일치로 **에러 없이 0건 수신**한다
 - 시간축은 recv_monotonic_ns를 쓴다 (stamp 아님 — 로봇 클록은 스트림이
   죽으면 신뢰할 수 없고, 워치독/판정 창은 수신 단조시계 기준이다)
-- 프레임 필드: stamp, recv_monotonic_ns, wkc(정상 3), tx_cycle_seq,
-  axis_valid_mask/stale/oper/fault(비트마스크), am_rx_age_ms, status_flags
-- 축 필드(12칸, 현 기체는 6칸 사용): position_rad, velocity_rad_s,
-  current_a, dob_a, bus_v, temp_c, pos_ref_echo_rad, kp_echo, kd_echo,
-  abs_valid, age_ms, valid/stale/oper/fault
+- 프레임 필드 (실기 msg introspect로 확정, 2026-08-05):
+  stamp, recv_monotonic_ns(uint64), wkc(int32, 정상 3), tx_cycle_seq(uint32),
+  am_rx_seq_echo, relay_seq_echo, axis_valid_mask/axis_stale_mask/
+  axis_oper_mask/axis_fault_mask(uint16 비트마스크 4종), am_rx_age_ms(uint16),
+  status_flags(uint32), **axis: AxisFeedback[12]** (필드명이 axes가 아니라
+  axis — 단수)
+- AxisFeedback: loop_cnt, position_rad, velocity_rad_s, current_a, dob_a,
+  bus_v, temp_c, pos_ref_echo_rad, kp_echo, kd_echo, abs_valid, axis_seq,
+  age_ms, oper/stale/valid/fault(boolean)
+- 축 플래그와 프레임 마스크가 중복 제공된다 — 보수적으로 합친다
+  (긍정 플래그 valid/oper는 AND, 부정 플래그 stale/fault는 OR)
 - 미사용 축은 valid=False로 들어온다 — 감지기는 usable 마스크로 걸러낸다
 
 rclpy/agx_msgs는 **지연 import** (start()에서만): 개발 환경(rclpy 없음)에서도
@@ -40,20 +46,23 @@ def _axis_array(axes, name, default=0.0):
     return out
 
 
-def _axis_bool(axes, name, default=False, mask: int | None = None):
-    """축 불리언: 축 필드 값과 프레임 비트마스크를 OR/AND로 합친다."""
+def _axis_bool(axes, name, default=False):
     out = np.full(N_AXES, bool(default))
     for i, ax in enumerate(axes[:N_AXES]):
         out[i] = bool(getattr(ax, name, default))
-    if mask is not None:
-        bits = np.array([(int(mask) >> i) & 1 for i in range(N_AXES)],
-                        dtype=bool)
-        return out, bits
     return out
+
+
+def _mask_bits(mask: int) -> np.ndarray:
+    return np.array([(int(mask) >> i) & 1 for i in range(N_AXES)], dtype=bool)
 
 
 def msg_to_frame(msg) -> PhorceFeedback:
     """agx_msgs/PhorceFeedback → 우리 프레임. 순수 함수 (rclpy 불필요).
+
+    축 플래그(AxisFeedback.valid 등)와 프레임 마스크(axis_*_mask)가 중복
+    제공된다 — 둘이 어긋나면 보수 쪽을 택한다:
+    긍정(valid/oper)은 AND, 부정(stale/fault)은 OR.
 
     신뢰성 강등 규칙 (수치를 고치지 않고 마스크로만 표현한다):
     - wkc != 3        → 전 축 stale (EtherCAT 사이클이 깨진 프레임)
@@ -61,16 +70,21 @@ def msg_to_frame(msg) -> PhorceFeedback:
       수신 벽시계 워치독이 못 잡는 유일한 구멍이라 여기서 잡는다)
     - 미장착/미사용 축  → valid=False (msg가 이미 그렇게 준다)
     """
-    axes = list(getattr(msg, "axes", []) or [])
+    # 실기 msg 필드명은 axis (단수, AxisFeedback[12]) — introspect 확정
+    axes = list(getattr(msg, "axis", None) or getattr(msg, "axes", []) or [])
     n_present = len(axes)
 
-    valid_axis, valid_bits = _axis_bool(
-        axes, "valid", mask=int(getattr(msg, "axis_valid_mask", 0)))
-    valid = valid_axis & valid_bits
+    valid = _axis_bool(axes, "valid") & _mask_bits(
+        getattr(msg, "axis_valid_mask", 0))
+    oper = _axis_bool(axes, "oper") & _mask_bits(
+        getattr(msg, "axis_oper_mask", 0))
+    stale = _axis_bool(axes, "stale") | _mask_bits(
+        getattr(msg, "axis_stale_mask", 0))
+    fault = _axis_bool(axes, "fault") | _mask_bits(
+        getattr(msg, "axis_fault_mask", 0))
     if n_present < N_AXES:                       # 안 온 축은 무조건 무효
         valid[n_present:] = False
 
-    stale = _axis_bool(axes, "stale")
     wkc = int(getattr(msg, "wkc", EXPECTED_WKC))
     am_age = float(getattr(msg, "am_rx_age_ms", 0.0))
     if wkc != EXPECTED_WKC or am_age > AM_RX_FRESH_LIMIT_MS:
@@ -88,9 +102,9 @@ def msg_to_frame(msg) -> PhorceFeedback:
         kp_echo=_axis_array(axes, "kp_echo"),
         kd_echo=_axis_array(axes, "kd_echo"),
         valid=valid,
-        oper=_axis_bool(axes, "oper"),
+        oper=oper,
         stale=stale,
-        fault=_axis_bool(axes, "fault"),
+        fault=fault,
         axis_valid_mask=int(getattr(msg, "axis_valid_mask", 0)),
         status_flags=int(getattr(msg, "status_flags", 0)),
         playing=False,                 # RealPhorceHAL._on_frame이 스탬프한다

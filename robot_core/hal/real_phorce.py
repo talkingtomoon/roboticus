@@ -1,21 +1,30 @@
 """RealPhorceHAL — phorce 파이썬 파사드 실구현 (공식 문서 5종 확정, 2026-08).
 
-확정된 파사드 계약 (추측 아님 — 문서 대조 완료):
-- 연결: phorce.connect()  (기본 target="robot" = 실물). PhorceUnavailable 가능
+확정된 파사드 계약 (문서 + **실기 소스 introspect 대조 완료**, 2026-08-05):
+- 연결: phorce.connect(target="robot", timeout=10.0) -> Robot.
+  PhorceUnavailable 가능 (액션 서버 부재 등 — _LAUNCH_HINT 포함)
 - 재생: robot.play_async(id, on_feedback=cb) -> PlayHandle
     PlayHandle: .wait(timeout) -> PlayResult, .cancel(), .done(속성),
-    .last_feedback
-- PlayResult: .ok(★속성 — 괄호 없음), .status_name("SUCCEEDED"|"CANCELED"만
-  — "REJECTED"는 존재하지 않는다. 거절은 예외 경로로만 온다),
-  .detail(한국어 안내 — 사용자에게 그대로 노출), .completed_count
+    .last_feedback.  **수락/거절도 비동기** — play_async는 항상 핸들을 주고,
+    거절은 wait()가 예외로 던진다. wait 타임아웃은 builtin TimeoutError
+    (재생은 계속). 우리는 수락 프로브(_ACCEPT_PROBE_S)로 거절을 동기 승격
+- PlayResult: .ok(★속성 — SUCCEEDED + physical_idle 등 8개 조건 전부),
+  .status_name("SUCCEEDED"|"CANCELED"만 — REJECTED/ABORTED는 예외로 온다),
+  .detail(한국어 안내 — 그대로 노출), .completed_count
 - 상태: robot.status(timeout=2.0).state_name — "IDLE"만 유휴의 증거.
   STALE/CONTRACT_INACTIVE/UNKNOWN은 "모름" (다른 필드로 idle 추측 금지)
-- 카탈로그: robot.motions() 순회 → m.id, m.name
-- 진단: robot.doctor() → .ok, .issues
+- 카탈로그: robot.motions는 네임스페이스(callable) — robot.motions() ->
+  Catalog(list처럼 순회 가능, .issues 포함) → Motion(.id/.name/.memo)
+- 진단: robot.doctor(timeout) -> DoctorReport(.ok 등)
 - 예외 계층: PhorceError > PhorceUnavailable | MotionRejected(> MotionBusy)
-  | MotionAborted.  MotionRejected: .code(숫자), .reason("REJECT_*"), .detail
-- 상수: MIN=1, MAX=50, NO_MOTION=0, MAX_SEQUENCE_LENGTH=1,
-  STATE_FRESH_LIMIT_MS=1500 (우리 K_STATE_FRESH_LIMIT_MS와 동일 출처)
+  | MotionAborted.  **MotionAborted도 .code/.detail을 가진다** — 거절과의
+  구분은 타입 이름으로 한다 (.code 덕 타이핑 금지, 실측으로 확인)
+- 거절코드 번호는 agx_msgs PlayMotionSequence.Result.REJECT_*와 일치
+  (3=RANGE, 4=NOT_LOADED, 5=QUEUE_FULL, 6=MASTER_NOT_OP,
+   11=AXIS_NOT_OPERATIONAL, 12=NOT_READY_FOR_MOTION, 13=RECOVERY_REQUIRED)
+- 상수: MIN_MOTION_ID=1, MAX_MOTION_ID=50, NO_MOTION_ID=0,
+  MAX_SEQUENCE_LENGTH=1, STATE_FRESH_LIMIT_MS=1500 (K_STATE_FRESH_LIMIT_MS와
+  동일 출처)
 
 거절코드 → 우리 분류는 hal/phorce.py classify_reject_code가 정본이다.
 **숫자로 비교한다** — .reason 문자열("REJECT_*") 비교 금지.
@@ -78,23 +87,38 @@ def _connect_facade():
             + _STARTUP_HINT) from e
 
 
+def _is_timeout(exc: Exception) -> bool:
+    """파사드 wait(timeout)의 시간 초과 — 재생은 계속 중이라는 뜻 (실측 확인:
+    builtin TimeoutError를 던진다)."""
+    return isinstance(exc, TimeoutError) or "Timeout" in type(exc).__name__
+
+
 def _translate_exception(exc: Exception) -> PhorceError:
-    """파사드 예외 → 우리 예외. 덕 타이핑 — .code가 있으면 거절이다.
+    """파사드 예외 → 우리 예외. **타입 이름으로 판별한다** — 파사드의
+    MotionAborted도 .code를 가지므로(실측 확인) .code 덕 타이핑만으로는
+    거절과 중단을 구분할 수 없다.
 
     파사드의 MotionRejected/MotionBusy/MotionAborted는 이름이 우리 것과
     같지만 타입은 다르다. 경계에서 전부 우리 타입으로 통일한다.
+    (파사드 미설치 환경에서도 이 모듈이 import돼야 하므로 isinstance 불가)
     """
+    name = type(exc).__name__
     code = getattr(exc, "code", None)
-    if code is not None:
-        code = int(code)
-        reason = str(getattr(exc, "reason", "") or "")
-        detail = str(getattr(exc, "detail", "") or "")
-        if classify_reject_code(code) == "busy":
+    reason = str(getattr(exc, "reason", "") or "")
+    detail = str(getattr(exc, "detail", "") or "")
+    if name == "MotionBusy":
+        return MotionBusy(detail or reason or "busy")
+    if name == "MotionRejected" and code is not None:
+        if classify_reject_code(int(code)) == "busy":
             return MotionBusy(detail or reason or "code 5")
-        return MotionRejected(code, message=reason, detail=detail)
+        return MotionRejected(int(code), message=reason, detail=detail)
+    if name == "MotionAborted":
+        # motion_id는 호출부가 안다 — 사유만 담아 재던질 재료로 넘긴다
+        return MotionAborted(0, f"{reason}: {detail}".strip(": ")
+                             + (f" (code={code})" if code is not None else ""))
     if isinstance(exc, PhorceError):
         return exc
-    return PhorceError(f"{type(exc).__name__}: {exc}")
+    return PhorceError(f"{name}: {exc}")
 
 
 class RealPhorceHAL(PhorceHAL):
@@ -152,6 +176,14 @@ class RealPhorceHAL(PhorceHAL):
         self._callbacks.append(callback)
 
     # ------------------------------------------------------------ 재생 경로
+    # 파사드는 수락/거절도 비동기다 — play_async는 즉시 핸들을 주고, 거절은
+    # wait()가 예외로 던진다 (실기 소스 _interpret 대조 확인). 우리 계약은
+    # "거절은 play_async에서 동기 예외" (감독 루프의 WAITING_OPERATOR 전이가
+    # 이를 전제)이므로, 짧은 수락 프로브로 거절을 동기 예외로 승격한다.
+    # 거절 응답은 로컬 액션 서버라 수십 ms 안에 온다 — 프로브가 다 차는 건
+    # 정상 수락(재생 진행) 경우뿐이고, 그 비용은 재생 시작 틱 1회에 1초다.
+    _ACCEPT_PROBE_S = 1.0
+
     def play_async(self, motion_id: int) -> PlayHandle:
         """판단 루프 스레드에서만 부른다. 거절은 여기서 즉시 예외로 온다."""
         self.play_call_count += 1
@@ -163,6 +195,27 @@ class RealPhorceHAL(PhorceHAL):
             facade_handle = self._robot.play_async(motion_id)
         except Exception as e:
             raise _translate_exception(e) from e
+
+        # 수락 프로브 — 이 창 안에 나오는 거절/즉시완료를 동기로 처리
+        try:
+            result = facade_handle.wait(timeout=self._ACCEPT_PROBE_S)
+        except Exception as e:
+            if _is_timeout(e):
+                pass                        # 수락되어 재생 진행 중 — 비동기 감시로
+            else:
+                converted = _translate_exception(e)
+                if isinstance(converted, MotionAborted):
+                    # 시작 직후 중단 — 우리 계약상 중단은 핸들 경로로 전달
+                    # (play_async가 던지는 건 Busy/Rejected/PhorceError뿐)
+                    self._finish(handle, aborted=MotionAborted(
+                        motion_id, converted.reason))
+                    return handle
+                raise converted from e
+        else:
+            # 프로브 안에 이미 종결 (아주 짧은 모션 / 즉시 CANCELED)
+            self._complete_from_result(handle, result)
+            return handle
+
         self._playing = True
         threading.Thread(target=self._await_result,
                          args=(facade_handle, handle),
@@ -172,25 +225,34 @@ class RealPhorceHAL(PhorceHAL):
     def _await_result(self, facade_handle, handle: PlayHandle) -> None:
         """파사드 핸들 완료 → 우리 핸들 완료/중단. 전용 데몬 스레드.
 
-        PlayResult.status_name은 "SUCCEEDED"|"CANCELED"뿐 — "REJECTED"
-        분기는 만들지 않는다 (거절은 play_async에서 예외로 이미 끝났다).
+        수락 프로브를 지나 여기까지 왔으면 남는 종결은 SUCCEEDED/CANCELED
+        (반환) 또는 MotionAborted/PhorceUnavailable(예외)이다. 프로브보다
+        늦게 오는 거절(희귀)은 중단으로 기록한다 — 다음 선곡의 play_async가
+        같은 거절을 동기로 다시 만나므로 상태 전이는 그쪽이 맡는다.
         """
         result = None
         while result is None:
             try:
                 result = facade_handle.wait(timeout=self._WAIT_SLICE_S)
             except Exception as e:
-                name = type(e).__name__
-                # 타임아웃류 + 아직 미완료 → 계속 대기 (긴 모션)
-                if "imeout" in name and not getattr(facade_handle, "done", False):
-                    continue
-                self._finish(handle, aborted=MotionAborted(
-                    handle.motion_id,
-                    str(getattr(e, "detail", "") or f"{name}: {e}")))
+                if _is_timeout(e) and not getattr(facade_handle, "done", False):
+                    continue                # 아직 재생 중 (긴 모션)
+                converted = _translate_exception(e)
+                reason = (converted.reason if isinstance(converted, MotionAborted)
+                          else f"late {type(converted).__name__}: {converted}")
+                self._finish(handle, aborted=MotionAborted(handle.motion_id, reason))
                 return
             if result is None and not getattr(facade_handle, "done", False):
                 continue                    # wait가 None을 돌려주는 구현 방어
-        if getattr(result, "ok", False):    # ★속성 — 괄호 없음 (문서 확정)
+        self._complete_from_result(handle, result)
+
+    def _complete_from_result(self, handle: PlayHandle, result) -> None:
+        """PlayResult(SUCCEEDED|CANCELED) → 우리 핸들 종결.
+
+        ok는 ★속성이다 (괄호 없음) — SUCCEEDED여도 physical_idle/
+        recovery_required 등 8개 조건을 전부 통과해야 True (실기 소스 확정).
+        """
+        if getattr(result, "ok", False):
             self._finish(handle, aborted=None)
         else:
             status = str(getattr(result, "status_name", "") or "CANCELED")

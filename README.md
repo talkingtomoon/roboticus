@@ -1,4 +1,4 @@
-# robot_core — 해커톤 코어 인프라 (phorce 판)
+﻿# robot_core — 해커톤 코어 인프라 (phorce 판)
 
 [![tests](https://github.com/talkingtomoon/roboticus/actions/workflows/tests.yml/badge.svg)](https://github.com/talkingtomoon/roboticus/actions/workflows/tests.yml)
 [![python](https://img.shields.io/badge/python-3.10%20|%203.11%20|%203.12-blue)](pyproject.toml)
@@ -47,7 +47,7 @@ robot_core/
   legacy/      임피던스 인터페이스 시절 스냅샷 (참고용 — 삭제 아님)
 scripts/       annotate_motion.py · validate_catalog.py · field_smoke.py ·
                baseline_selector_comparison.py · check_llm_model.py · legacy/
-tests/         240개 테스트, 실물·실제 API 없이 전부 통과
+tests/         244개 테스트, 실물·실제 API 없이 전부 통과
                (test_real_phorce.py — 파사드 시그니처 대조 fake 포함)
 examples/      demo_full_rehearsal.py · legacy/
 ```
@@ -59,7 +59,7 @@ git clone https://github.com/talkingtomoon/roboticus.git
 cd roboticus
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
-python -m pytest -q                                  # 240 tests
+python -m pytest -q                                  # 244 tests
 python examples/demo_full_rehearsal.py               # 리허설 시나리오 5종
 ```
 
